@@ -91,6 +91,19 @@
 - **/request, /resolve commands:** New OP commands for REQ and GOV cycles.
 - **OP guidance note:** Not all work goes through SG.
 
+### Orchestrator implementation (`orchestrator/`)
+Reference Python implementation of Spec v4:
+- ~3,000 LOC across 14 modules; 110 pytest tests anchored to spec invariants
+- Spec §16 async-locked shared state; AUTH/SUM split with immutable archival; Spec §15.2 malformed handling for all agents
+- Telegram bot (Spec §10–11, 25 commands) + MCP server (Spec §12, 21 tools); both resilient to transient API failures
+- System prompt auto-generation via framework section extraction (Spec §14 step 2)
+- CORTEX placeholder so toggling the flag doesn't crash on import
+
+### Claude Code plugin (`.claude-plugin/`, `skills/`, `templates/`)
+- Plugin manifest at repo root — cloning into `~/.claude/plugins/` makes this repo a working Claude Code plugin
+- `/vega:vega-init` skill: 13-step Q&A scaffold of a per-project VEGA deployment
+- Templates use upstream `docs/` and `wiki_seeds/` as the single source of truth — no duplication
+
 ### CORTEX Addon v0.2 BETA
 - Framework reference updated to v5.0
 - No architectural changes
