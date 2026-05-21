@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Project runtime
+agents/*/inbox/
+agents/*/outbox/
+artifacts/archive/
+cycles/active/
+op_backlog/
+state/*.json
+scope/
+
+# Environment
+.env
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
