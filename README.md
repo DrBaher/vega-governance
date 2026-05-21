@@ -85,14 +85,38 @@ The system runs on a Python orchestrator that executes each agent as a stateless
 - Anthropic API key
 - Telegram bot token ([create one via BotFather](https://t.me/BotFather))
 
-### Deploy with Claude Code
+### Install (Claude Code plugin)
 
-Give Claude Code the full document set from `docs/` and it will build the orchestrator from the specification:
+The repo doubles as a Claude Code plugin. Clone into your plugins directory:
 
 ```bash
-cd vega-governance
-claude "Build the VEGA orchestrator from the specs in docs/"
+cd ~/.claude/plugins
+git clone https://github.com/FreeValley/vega-governance.git
 ```
+
+Then in any Claude Code session, run `/reload-plugins`. The `/vega:vega-init` skill is now available — invoke it in any project directory and it walks you through a short Q&A, scaffolds the per-project deployment, and prints the bootstrap checklist.
+
+### Install (direct Python)
+
+```bash
+git clone https://github.com/FreeValley/vega-governance.git
+cd vega-governance/orchestrator
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+export ANTHROPIC_API_KEY=sk-ant-...
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_OP_CHAT_ID=...
+# Optional: enable MCP for substantive OP work via Claude session
+# export MCP_AUTH_TOKEN=...
+
+# Scaffold directory tree + extract per-agent system prompts from docs/
+.venv/bin/python main.py --init-only
+
+# Bootstrap with initial input
+.venv/bin/python main.py --bootstrap path/to/initial.md
+```
+
+See [orchestrator/README.md](orchestrator/README.md) for full Python-side install, operation, and the OP Telegram + MCP command libraries.
 
 The Orchestrator Spec is the implementation blueprint; the other documents provide architectural context.
 
