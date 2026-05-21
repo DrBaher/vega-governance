@@ -1,0 +1,16 @@
+{
+  "name": "vega",
+  "version": "0.2.0",
+  "description": "Deploy VEGA — a 9-agent V-model governance system (scope, test, build) with a Telegram operator interface. /vega:vega-init scaffolds a per-project orchestrator from a short Q&A.",
+  "author": {
+    "name": "Francisco Vega",
+    "email": "vega.francisco.j@gmail.com"
+  },
+  "homepage": "https://github.com/FreeValley/vega-governance",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FreeValley/vega-governance.git"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["governance", "v-model", "multi-agent", "orchestrator", "scope", "tests", "build", "claude"]
+}
