@@ -5,7 +5,7 @@
 **Date:** May 2026
 **Status:** BETA — architecture validated through design review, not yet battle-tested
 **Base documents:**
-- VEGA Architecture Framework v4.0 (baseline — not modified by this document)
+- VEGA Architecture Framework v5.0 (baseline — not modified by this document)
 - VEGA Orchestrator Technical Specification (baseline — not modified by this document)
 **This document:** Self-contained add-on. Specifies the CORTEX system AND the delta to apply to baseline documents when CORTEX is active.
 
@@ -69,7 +69,7 @@ The agent never sees strengths, heat scores, evidence counts, or decay factors. 
 
 These sections specify what changes in the baseline documents when CORTEX is deployed. The baseline documents themselves are not modified — these deltas are applied at deployment.
 
-### 3.1 Modifications to VEGA Architecture Framework v4.0
+### 3.1 Modifications to VEGA Architecture Framework v5.0
 
 **§6 Wiki Schema — add optional page:**
 
@@ -674,4 +674,4 @@ The orchestrator tracks wiki entry counts per agent after each execution. Transi
 
 ---
 
-*This specification layers on top of the VEGA Architecture Framework v4.0 and VEGA Orchestrator Technical Specification without modifying either. When CORTEX is active, the modifications specified in §3 are applied at deployment. When CORTEX is inactive, the baseline documents operate as-is.*
+*This specification layers on top of the VEGA Architecture Framework v5.0 and VEGA Orchestrator Technical Specification without modifying either. When CORTEX is active, the modifications specified in §3 are applied at deployment. When CORTEX is inactive, the baseline documents operate as-is.*

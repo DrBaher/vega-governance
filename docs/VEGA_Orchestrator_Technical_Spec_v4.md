@@ -1,10 +1,10 @@
 # V-model Enabled Governance Architecture (VEGA)
-## Orchestrator — Technical Specification v3
+## Orchestrator — Technical Specification v4
 
 **Author:** Francisco
 **Date:** May 2026
 **For:** Claude Code implementation
-**References:** VEGA Architecture Framework v4.0 (all §-references point to this document)
+**References:** VEGA Architecture Framework v5.0 (all §-references point to this document)
 
 ---
 
@@ -101,6 +101,7 @@ vega/
 │   ├── models.py                # Data models (Artifact, Agent, Cycle, etc.)
 │   ├── sequence_manager.py      # Document ID + decision sequence counters
 │   ├── state_manager.py         # Atomic state operations with locking
+│   ├── mcp_server.py            # MCP server — VEGA tools for Claude sessions
 │   └── cortex_script.py         # CORTEX computation (when CORTEX is active)
 │
 ├── framework/
@@ -181,7 +182,11 @@ AGENT_MODEL_OVERRIDES = {
 
 # Extended thinking
 EXTENDED_THINKING_ENABLED = True
-THINKING_BUDGET_TOKENS = 10000  # Per execution
+# Thinking parameter shape is API-version-dependent:
+#   Claude 4.x+: {"type": "adaptive"} with output_config.effort
+#   Older models: {"type": "enabled", "budget_tokens": N}
+# The orchestrator tries supported modes in order and falls back gracefully.
+THINKING_BUDGET_TOKENS = 10000  # Used for legacy mode if needed
 
 # Prompt caching — static content (system prompt, UNIVERSAL, wiki) is cached
 # across executions of the same agent. Reduces input token cost significantly.
@@ -202,6 +207,11 @@ STATE_DIR = f"{BASE_DIR}/state"
 # Telegram
 TELEGRAM_BOT_TOKEN = "..."
 TELEGRAM_OP_CHAT_ID = "..."
+
+# MCP Server
+MCP_ENABLED = True
+MCP_PORT = 8420
+MCP_AUTH_TOKEN = "..."  # Bearer token, shared with OP's Claude MCP config
 
 # Polling
 POLL_INTERVAL = 10  # Seconds between inbox checks
@@ -233,15 +243,15 @@ EXT_BUILD_ENABLED = True
 
 | Agent | Reads | Writes |
 |-------|-------|--------|
-| SG | own wiki, universal/, scope/, inbox/ | own wiki, outbox/ |
-| SA | own wiki, universal/, scope/, inbox/ | own wiki, outbox/ |
+| SG | own wiki, universal/, scope/, framework/ (guardian view §12.2), inbox/ | own wiki, outbox/ |
+| SA | own wiki, universal/, scope/, framework/ (summary §12.1), inbox/ | own wiki, outbox/ |
 | SE | own wiki, universal/, scope/, inbox/ | own wiki, outbox/, scope/ (only via DOC) |
-| TG | own wiki, universal/, scope/, inbox/, test_models/full/ | own wiki, outbox/, test_models/full/ |
-| TA | own wiki, universal/, scope/, inbox/, test_models/full/ | own wiki, outbox/ |
+| TG | own wiki, universal/, scope/, framework/ (guardian view §12.2), inbox/, test_models/full/ | own wiki, outbox/, test_models/full/ |
+| TA | own wiki, universal/, scope/, framework/ (summary §12.1), inbox/, test_models/full/ | own wiki, outbox/ |
 | TE | own wiki, universal/, inbox/, test_models/full/, test_models/build/ | own wiki, outbox/, test_models/full/, test_models/build/ |
-| BR | own wiki, universal/, scope/, inbox/, test_models/build/ | own wiki, outbox/ |
-| BTA | own wiki, universal/, inbox/, test_models/full/ | own wiki, outbox/ |
-| SYS | ALL wikis (read), universal/, artifacts/archive/, ALL log.md, execution_log.json | own wiki, universal/ (write), outbox/ |
+| BR | own wiki, universal/, scope/, framework/ (summary §12.1), inbox/, test_models/build/ | own wiki, outbox/ |
+| BTA | own wiki, universal/, framework/ (summary §12.1), inbox/, test_models/full/ | own wiki, outbox/ |
+| SYS | ALL wikis (read), universal/, framework/ (SYS view §12.3), artifacts/archive/, ALL log.md, execution_log.json | own wiki, universal/ (write), outbox/ |
 
 ---
 
@@ -289,11 +299,19 @@ ROUTING_TABLE = {
     ("BR", "DEV"):          [{"to": "SG"}],
     ("TG", "TRI"):          [{"to": "BR"}],
 
-    # External Build (§2.5) — special handling
+    # External Build (§2.5) — routed for archive + log
     ("BR", "BRP"):          [{"to": "EXT"}],
+    ("EXT", "BRQ"):         [{"to": "BR"}],
 
-    # Domain Expert (§2.6) — special handling
+    # Domain Expert (§2.6) — routed through SG
     ("SG", "DE_OUT"):       [{"to": "DE"}],
+    ("DE", "DE_IN"):        [{"to": "SG"}],
+
+    # Operator Request (§2.1 S13)
+    ("OP", "REQ"):          [{"to": "SG"}],
+
+    # AUTH from OP (§7.2) — archived immutably and delivered to SG
+    ("OP", "AUTH"):         [{"to": "SG"}],
 
     # System Auditor (§2.7)
     ("SYS", "GOV"):         [{"to": "OP"}],
@@ -328,9 +346,9 @@ OP_BOUND_TYPES = {
 3. For each recipient: copies artifact to `agents/{recipient}/inbox/`.
 4. Archives to `artifacts/archive/`. **Archive is immutable — never modified after write.**
 5. Appends to `state/routing_log.json`.
-6. For OP-bound types: copies to `op_backlog/pending/`. Sends Telegram notification.
+6. For OP-bound types: copies to `op_backlog/pending/`. Sends Telegram notification (best-effort — see §10.2).
 7. For EXT/DE-bound types: see §12 External Interfaces.
-8. **Unknown routing key** (type+sender not in table): log as governance violation, auto-create GOV-SYS-NNN, route GOV to OP backlog. Do not deliver artifact.
+8. **Unknown routing key** (type+sender not in table): log as governance violation, auto-create GOV with timestamp-based ID (`GOV-SYS-AUTO-<epoch_ms>`) — the AUTO prefix distinguishes from SYS-minted GOV. Route GOV to OP backlog. Do not deliver artifact. SYS can re-issue with a proper sequence ID during its next audit if needed. Auto-generated GOV artifacts remain in the archive permanently (immutable). When SYS re-issues, the new GOV-SYS-NNN references the auto-GOV in its references field.
 
 ### 4.4 REJ Routing Resolution
 
@@ -407,7 +425,7 @@ async def check_and_execute(agent_code: str):
     response = await anthropic_client.messages.create(
         model=model,
         max_tokens=MAX_TOKENS,
-        thinking={"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS},
+        thinking=get_thinking_config(model),  # API-version-dependent; see §3.1
         system=system_prompt,
         messages=messages
     )
@@ -500,7 +518,7 @@ Cache hits are highest for agents that execute frequently with stable wikis (SG,
 
 ### 5.3 System Prompt Composition
 
-Each agent's `system_prompt.md` contains:
+Each agent's `system_prompt.md` embeds:
 
 ```markdown
 # Role: [Agent Name] ([Code])
@@ -512,11 +530,37 @@ Instance: [ROLE]-S[NNN]
 ## Your Role
 [Full role definition from Framework §5.X]
 
-## File Locations
-- Your wiki: Read and update per the wiki protocol.
-- UNIVERSAL: Contains manifesto, cross_agent_rules, case_index.
-- Scope documents: [list, if agent has access]
+## Document Type Codes
+[From Framework §1 — the artifact type vocabulary]
 
+## Your Interaction Catalog
+[Subset of Framework §2 — rows where this agent is sender or recipient]
+```
+
+Additional context loaded per execution (cacheable via prompt caching):
+
+```markdown
+## Framework View (tiered per Framework §12)
+- SG, TG: §1 + §2 + §9 + §10 + project addendum (~12k tokens)
+- SYS: §1 + §2 + §5 + §10 (~18k tokens)
+- SA, TA, BR, BTA: Framework Summary from §12.1 (~2k tokens)
+- SE, TE: none (system prompt is self-contained)
+
+## UNIVERSAL
+[manifesto.md, cross_agent_rules.md, case_index.md]
+
+## Scope Documents
+[Where agent has access per §3.2]
+
+## Your Wiki
+[All wiki pages for this agent]
+```
+
+The system prompt is self-contained for artifact production (the agent knows its types and routes). Framework context is loaded per the tiered model in Framework §12.
+
+The system prompt also includes the output format specification:
+
+```markdown
 ## Output Format
 
 ### ARTIFACT
@@ -602,7 +646,7 @@ async def execute_sys(audit_request=None):
     response = await anthropic_client.messages.create(
         model=get_model("SYS"),
         max_tokens=MAX_TOKENS,
-        thinking={"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS},
+        thinking=get_thinking_config(get_model("SYS")),  # API-version-dependent
         system=load_system_prompt("SYS"),
         messages=[{"role": "user", "content": inbox_content}]
     )
@@ -641,13 +685,15 @@ Bounded multi-turn interactions maintain a messages array across executions. The
 | Cycle type | Participants | Opens on | Closes on |
 |-----------|-------------|----------|-----------|
 | SCN application | SG ↔ SE | SCN-SG-NNN issued | VAL-SG-NNN issued |
-| TCN application | TG ↔ TE | TCN-TG-NNN issued | VAL-TG-NNN with certificate=second |
+| TCN application | TG ↔ TE | TCN-TG-NNN issued | VAL-TG-NNN with certificate=build |
 | PROP exchange | SG ↔ OP | PROP-SG-NNN issued | AUTH-OP-NNN issued |
 | Triage | TG (internal) | TFR-BTA-NNN received | TRI/ESC/TCN produced |
 | Build scope Q&A | BR ↔ EXT | PRO-SCOPE arrives at BR | VR-BTA-NNN for this scope version, or next PRO-SCOPE |
 | Build test Q&A | BR ↔ EXT | PRO-TEST-BUILD arrives at BR | VR-BTA-NNN for this test version, or next PRO-TEST-BUILD |
 | Build results | BR ↔ EXT | BRQ (results) received from EXT | VR-BTA-NNN relayed to EXT |
 | Build remediation | BR ↔ EXT | TRI relayed to EXT | New results submitted by EXT |
+| DE Q&A | SG ↔ DE | DE_OUT-SG-NNN sent | DE_IN received for that question |
+| GOV exchange | SYS ↔ OP | GOV-SYS-NNN or /sys | /resolve GOV-SYS-NNN [action] |
 
 ### 6.2 Cycle Manager
 
@@ -684,14 +730,14 @@ class CycleManager:
 
     def check_cycle_events(self, artifact):
         """Check if an artifact opens or closes a cycle."""
-        # TCN cycle: only closes on second certificate
+        # TCN cycle: only closes on build certificate
         if (artifact.type == "VAL" and artifact.sender == "TG" 
                 and hasattr(artifact, 'certificate')):
-            if artifact.certificate == "second":
+            if artifact.certificate == "build":
                 cycle = self.get_cycle_by_participants("TG", "TE")
                 if cycle:
                     self.close_cycle(cycle)
-            # first certificate doesn't close — TE still generates build version
+            # full certificate doesn't close — TE still generates build version
             return
 
         # Build cycles: close on VR for this version, or superseded by new PRO-SCOPE/PRO-TEST-BUILD
@@ -740,7 +786,15 @@ class Cycle:
 
 Note: thinking blocks from prior turns are automatically excluded from context by the API — they don't inflate cycle context.
 
-### 6.4 Cycle Context Monitoring
+### 6.4 Exchange Turns Are Cycle-Internal
+
+Exchange turns within a cycle (OP's questions during PROP, OP's follow-ups during GOV) are NOT standalone artifacts. They are turns in the cycle's messages array. Only cycle-opening and cycle-closing events produce formal artifacts (PROP, AUTH, SUM, GOV, SCN, VAL, etc.) that route through the routing table and archive independently.
+
+The cycle archive (saved when the cycle closes) contains the complete messages array — the full dialogue is preserved for SYS audit. SUM-SG-NNN provides the compiled summary for PROP cycles.
+
+To trigger agent execution from an exchange turn, the orchestrator adds the turn to the cycle's messages array and flags the agent for execution. No artifact is created or routed.
+
+### 6.5 Cycle Context Monitoring
 
 Within a long cycle (e.g., BR↔EXT scope Q&A with many turns), the messages array grows. The orchestrator monitors:
 
@@ -917,6 +971,11 @@ class WikiManager:
             ---
             [Rule content]
         
+        Format is strict — fields must appear in this exact order:
+        excluded_for, then gov_reference, then --- separator, then content.
+        SYS is the only UNIVERSAL writer and must produce this format.
+        The orchestrator's exclusion filter depends on this structure.
+        
         Excluded sections are replaced with a note:
             [Rule excluded for BR — pending GOV-SYS-005 resolution]
         
@@ -1083,6 +1142,10 @@ class OPBacklog:
 
 ### 10.2 Telegram Bot
 
+**Notification resilience:** Telegram notification failures must not break artifact routing or archival. The routing pipeline completes archive, deliver, and log before attempting notification. If notification fails: retry once as plain text (no markdown formatting). If still fails, log the notification failure and continue. The artifact is accessible via /backlog regardless. Messages exceeding 4096 characters are truncated with a `[truncated — use /history <id> for full content]` suffix.
+
+**Readiness barrier:** After starting the Telegram bot polling task, the orchestrator must await bot readiness before sending the startup greeting or any other message. Readiness means the bot's polling connection is established and send() will reach Telegram, not shim to stdout.
+
 ```python
 class TelegramBot:
     async def notify(self, artifact: Artifact):
@@ -1188,10 +1251,12 @@ COMMANDS = {
     "/approve":  "Usage: /approve [artifact-id] — Approve PROP/GOV",
     "/reject":   "Usage: /reject [artifact-id] [reason]",
     "/modify":   "Usage: /modify [artifact-id] [instructions]",
+    "/resolve":  "Usage: /resolve [GOV-id] [action] — Close GOV exchange with SYS",
 
     # EXTERNAL INTERFACES
     "/build":    "Usage: /build [message] — Forward to BR inbox as BRQ-EXT",
     "/expert":   "Usage: /expert [message] — Forward to SG inbox as DE_IN",
+    "/request":  "Usage: /request [message] — Submit REQ-OP-NNN to SG (ad-hoc scope work)",
 
     # REFERENCE
     "/agents":   "List all agents with roles (one-line each)",
@@ -1204,19 +1269,102 @@ COMMANDS = {
 
 ---
 
+**Note for OP: Not all work goes through SG.**
+
+- Scope changes → SG (via /request or process findings from agents)
+- Framework/architecture changes → OP edits directly, use /sys to verify consistency
+- Governance concerns → /sys for audit
+- Agent configuration → /model, /rotate, /pause, /resume
+
+SG governs scope documents. OP governs the framework.
+
+---
+
 ## 12. External Interfaces
 
-### 12.1 External Build (via BR)
+### 12.1 OP Interfaces — Telegram + MCP
+
+The operator interacts with the orchestrator through two interfaces:
+
+**Telegram (push + quick actions).** Notifications arrive on the operator's phone. Quick approvals, rejections, and commands via structured `/command` syntax. Telegram is the doorbell — it alerts OP that something needs attention.
+
+**MCP Server (pull + substantive work).** An MCP server exposes VEGA tools to any Claude session. The operator talks to Claude naturally: "What's pending in VEGA?" → Claude calls `vega_backlog()`. "I disagree with SG's recommendation" → Claude calls `vega_exchange()`. MCP is the desk where OP does the work.
+
+Both interfaces call the same orchestrator internals. The orchestrator doesn't know or care which interface triggered an action.
+
+```
+                  ┌─────────────────┐
+                  │   Orchestrator   │
+                  │   (unchanged)    │
+                  └───┬─────────┬───┘
+                      │         │
+              ┌───────┴──┐  ┌──┴────────┐
+              │ Telegram  │  │ MCP Server │
+              │ Bot       │  │            │
+              │ (push +   │  │ (tools for │
+              │  quick)   │  │  any Claude│
+              │           │  │  session)  │
+              └───────────┘  └───────────┘
+```
+
+MCP cannot push notifications (it's request-response only). The workflow: Telegram notifies → OP decides where to handle → quick action in Telegram or substantive work via MCP.
+
+**Deployment:** The MCP server runs in the same process as the orchestrator (shared Python objects) and exposes an HTTP endpoint. Claude sessions connect remotely — OP can work from any machine. The orchestrator is deployment-independent of OP's client.
+
+**Authentication:** Bearer token configured at deployment. The MCP server rejects requests without a valid token. One token per deployment, matching the single-operator model (same as Telegram's OP chat ID). Token is set in config and shared with OP's Claude MCP connection settings. For production: HTTPS mandatory.
+
+**Mediation note:** Messages submitted via MCP may be paraphrased by the mediating Claude session. The cycle archive records what was sent to the agent, not what OP typed. For word-exact intent, OP can instruct Claude "send exactly this: ..." or use Telegram (which preserves OP's literal text). SYS should treat MCP-sourced exchange turns as OP-directed but potentially mediated.
+
+### 12.2 MCP Server Tools
+
+The MCP server exposes the same operations as the Telegram command library:
+
+```python
+# Status & Monitoring
+vega_status()              # System overview
+vega_backlog()             # Pending PROP/GOV items
+vega_agent(code)           # Agent details
+vega_cycles()              # Active conversation cycles
+vega_history(artifact_id)  # Routing history
+
+# Decision
+vega_approve(artifact_id)
+vega_reject(artifact_id, reason)
+vega_modify(artifact_id, instructions)
+vega_exchange(artifact_id, message)  # Multi-turn SG↔OP or SYS↔OP dialogue
+vega_resolve(gov_id, action)         # Close GOV exchange with SYS
+
+# Audit & Governance
+vega_sys(instruction)      # Trigger SYS audit
+vega_thinking(artifact_id) # View agent reasoning
+vega_wiki(code)            # Agent wiki summary
+vega_log(code, n)          # Recent log entries
+
+# Control
+vega_pause(code)
+vega_resume(code)
+vega_rotate(code)
+vega_model(code, model)
+
+# Scope Input
+vega_request(message)      # Submit REQ-OP-NNN to SG
+
+# External Relay
+vega_build(message)        # Forward to BR
+vega_expert(message)       # Forward to SG for DE
+```
+
+### 12.3 External Build (via BR)
 
 At launch: OP relay. BR produces BRP → OP forwards. Build responds → OP uses `/build [message]` → orchestrator creates BRQ-EXT artifact in BR inbox.
 
 Automation target: Telegram channel for build team, or file drop directory watched by orchestrator.
 
-### 12.2 Domain Expert (via SG)
+### 12.4 Domain Expert (via SG)
 
 At launch: OP relay. SG produces DE_OUT → OP forwards. Expert responds → OP uses `/expert [message]` → orchestrator creates DE_IN artifact in SG inbox.
 
-### 12.3 Relay Is Not Decision-Making
+### 12.5 Relay Is Not Decision-Making
 
 Per D-ARCH-026: OP has two decision channels (SG, SYS). Relay duties at launch are operational logistics — OP doesn't evaluate, modify, or approve relayed content. When relay is automated, the decision channels remain unchanged.
 
@@ -1239,12 +1387,14 @@ async def main():
     executor = AgentExecutor(wiki_manager, sequence_manager,
                              instance_manager, cycle_manager)
 
-    # Start Telegram bot
+    # Start Telegram bot + await readiness (§10.2 readiness barrier)
     asyncio.create_task(telegram_bot.start_polling())
+    await telegram_bot.await_readiness()  # Poll until bot is connected
 
     execution_count = 0
 
     while True:
+      try:
         # 1. Route: check all agent outboxes
         for agent_code in AGENTS:
             outbox_items = artifact_store.get_outbox(agent_code)
@@ -1288,7 +1438,13 @@ async def main():
             for agent_code in AGENTS:
                 cortex_script.periodic_maintenance(agent_code)
 
-        await asyncio.sleep(POLL_INTERVAL)
+      except Exception as e:
+        # Crash-resilient: a bad tick must not kill the orchestrator.
+        # Log error, notify OP, continue to next tick.
+        log_error("main_loop", e)
+        await telegram_bot.send(f"⚠️ Tick failed — {type(e).__name__}: {e}")
+
+      await asyncio.sleep(POLL_INTERVAL)
 
 
 def should_run_sys(execution_count):
@@ -1555,6 +1711,15 @@ pyyaml >= 6.0
 | D-ARCH-023 Two-certificate | Cycle management tracks full→build certificate sequence |
 | D-ARCH-024 NOTE | NOTE artifact type in routing table + inbox handling |
 | D-ARCH-025 AUTH + SUM | Split artifacts: AUTH-OP-NNN + SUM-SG-NNN (§7.2) |
-| D-ARCH-026 OP channels | Two decision (SG, SYS) + relay duties (§12.3) |
-| D-ARCH-031 SYS exclusion | SYS execute checks in `execute_sys()` (§5.5) |
+| D-ARCH-026 OP channels | Two decision (SG, SYS) + relay duties (§12.5) |
+| D-ARCH-031 SYS exclusion | SYS execute checks in `execute_sys()` (§5.6). Strict metadata format in `wiki_manager._filter_exclusions()` (§8.1) |
+| D-ARCH-032 Non-blocking | All agents continue work while external responses pending. OP backlog, pending_external.md, pending_build.md |
+| D-ARCH-033 REQ artifact | `("OP", "REQ")` routing entry (§4.1). `/request` command (§11). `vega_request()` MCP tool (§12.2) |
+| D-ARCH-034 GOV dialogue | GOV exchange cycle (§6.1). `/resolve` command (§11). `vega_resolve()` MCP tool (§12.2) |
+| D-ARCH-035 DE non-blocking | DE Q&A cycle (§6.1). `/expert` command (§11). `vega_expert()` MCP tool (§12.2) |
+| §12 Agent Context Views | Tiered framework loading in `executor._load_framework_view()` (§5.3) |
+| §12.1 Framework Summary | ~2k token summary loaded for SA, TA, BR, BTA |
+| §12.2 Guardian View (SG, TG) | §1 + §2 + §9 + §10 + addendum (~12k tokens) |
+| §12.3 SYS View | §1 + §2 + §5 + §10 (~18k tokens) |
+| MCP Server | `mcp_server.py` (§12.1, §12.2). HTTP endpoint + bearer auth |
 | CORTEX add-on | `cortex_script.py` integration point in executor (§5.1) |

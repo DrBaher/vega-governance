@@ -1,5 +1,5 @@
 # V-model Enabled Governance Architecture (VEGA)
-## Architecture Framework v4.0
+## Architecture Framework v5.0
 
 **Author:** Francisco
 **Date:** May 2026
@@ -20,6 +20,7 @@ This document defines a multi-agent governance framework applicable to any proje
 7. **Role definitions are stable; wikis evolve.** The role is the fundament — it defines what the agent does, its inputs, outputs, and constraints. The wiki teaches it to do it better over time. Role = constitution. Wiki = case law. The constitution doesn't change every session; the case law grows.
 8. **Agents re-ground in their role periodically.** Every 3 work cycles, agents re-read their role definition and wiki index. Context accumulation causes role drift — the agent responds from recent conversational patterns instead of its actual instructions. Re-grounding is the fix.
 9. **Five-layer authority hierarchy.** Sources (scope documents) > Role definitions > Own wiki > UNIVERSAL wiki > Session context. On contradiction, higher layer wins. Agent follows the higher layer, flags the contradiction, OP resolves.
+10. **No agent blocks on external responses.** OP, Domain Expert, and External Build are all external parties with unpredictable response times. When an agent sends an outbound request (PROP, GOV, DE_OUT, BRP), it logs the pending item and continues all work not dependent on the response. Responses feed into the next cycle, not the current one.
 
 **Operational context:** Agents run as Claude chat sessions. Context saturation is the core operational constraint — sessions lose precision as context fills. The wiki system is the structural fix: persistent knowledge that survives session boundaries. The handoff protocol ensures continuity when sessions must be replaced.
 
@@ -30,7 +31,7 @@ This document defines a multi-agent governance framework applicable to any proje
 1. [Naming Convention — Transiting Documents](#1-naming-convention--transiting-documents)
 2. [Interaction Catalog](#2-interaction-catalog)
 3. [Universal Rules (all agents)](#3-universal-rules-all-agents)
-4. [Domain Expert Interaction Protocol](#4-clinical-expert-interaction-protocol)
+4. [Domain Expert Interaction Protocol](#4-domain-expert-interaction-protocol)
 5. [Role Definitions](#5-role-definitions)
 6. [Agent Wiki Specification](#6-agent-wiki-specification)
 7. [Test Model Format Specification](#7-test-model-format-specification)
@@ -38,6 +39,7 @@ This document defines a multi-agent governance framework applicable to any proje
 9. [Interaction Flows](#9-interaction-flows)
 10. [Decision Log](#10-decision-log)
 11. [Implementation Notes for Claude Code](#11-implementation-notes-for-claude-code)
+12. [Agent Context Views](#12-agent-context-views)
 
 ---
 
@@ -94,7 +96,7 @@ Every document or message that transits between agents carries a unique identifi
 | Code | Name | Issuer(s) | Description |
 |------|------|-----------|-------------|
 | DOC | Documentation Update | SE, TE | Editor's submission of updated docs for guardian validation |
-| VAL | Validation | SG, TG | Guardian confirms editor's DOC matches SCN/TCN |
+| VAL | Validation | SG, TG | Guardian confirms editor's DOC matches SCN/TCN. TG VAL includes certificate field: `full` (full test model validated) or `build` (build version validated against full). |
 | REV | Revision Request | SG, TG | Guardian rejects DOC with specific discrepancies |
 | REJ | Rejection | SG, TG | Guardian rejects a finding with explanation |
 | TRI | Triage Result | TG | Failure classification: build defect / test model defect / scope defect |
@@ -106,14 +108,14 @@ Every document or message that transits between agents carries a unique identifi
 | AUTH | Authorization | OP | OP's final direction after working exchange. Immutable at issuance. |
 | SUM | Exchange Summary | SG | SG's summary of SG↔OP exchange, written after AUTH received. References AUTH-OP-NNN. Immutable. Together AUTH + SUM form the complete auditable record of the dialogue. |
 | GOV | Governance Finding | SYS | Architecture deviation, process violation, missed gate, behavioral drift — reported to OP |
+| REQ | Operator Request | OP | Ad-hoc input from OP to SG. SG triages the content — analyses scope impact, determines if it warrants SCN, REJ, or is informational — and produces PROP if action is needed. |
 
 **External Expert Communications:**
 
 | Code | Name | Issuer(s) | Description |
 |------|------|-----------|-------------|
-| DE_NNN_OUT | Expert Review Request | SG | Outbound to Domain Expert: review requests, clarification questions, data |
-| DE_NNN_IN | Expert Review Response | DE | Inbound from Domain Expert: review results (xlsx + narrative), confirmations |
-| DE_NNN_SG | Expert Response Assessment | SG | SG's analysis of Domain Expert's response: contradictions, action items |
+| DE_OUT | Expert Review Request | SG | Outbound to Domain Expert: review requests, clarification questions, data |
+| DE_IN | Expert Review Response | DE | Inbound from Domain Expert: review results, confirmations |
 
 **Propagation Documents (carry versioned artefacts, not independently numbered):**
 
@@ -150,9 +152,11 @@ This is the exhaustive set. If an interaction is not listed here, it does not ex
 | S7 | SG | SA | PRO-SCOPE | Validation cycle complete | Validated scope |
 | S8 | OP | SA | (manual) | Initialisation (one-time) | Scope baseline |
 | S9 | OP | SG | (manual) | Initialisation (one-time) | Scope baseline, initial directives |
-| S10 | SG | OP | PROP-SG-NNN | SG completes triage/analysis | Proposed disposition — initiates working exchange. All inputs (FND, ESC, DEV, ad-hoc) processed through the same analysis, same flow. |
+| S10 | SG | OP | PROP-SG-NNN | SG completes triage/analysis | Proposed disposition — initiates working exchange. All inputs (FND, ESC, DEV, REQ, ad-hoc) processed through the same analysis, same flow. |
 | S11 | OP | SG | AUTH-OP-NNN | Working exchange concludes | OP's final direction. Immutable at issuance. |
 | S12 | SG | (archive) | SUM-SG-NNN | After AUTH received | Exchange summary: what OP challenged, what SG refined, key reasoning. Archived for SYS audit and future sessions. |
+| S13 | OP | SG | REQ-OP-NNN | OP initiates scope work | Operator request — SG triages and produces PROP if action needed |
+| S14 | DE | SG | DE_IN | Domain Expert responds | Expert response to DE_OUT — routed through router, archived |
 
 ### 2.2 Test Lane
 
@@ -201,9 +205,8 @@ This is the exhaustive set. If an interaction is not listed here, it does not ex
 
 | # | From | To | Document | Trigger | Content |
 |---|------|----|----------|---------|---------|
-| H1 | SG | DE | DE_NNN_OUT | Expert review needed | Review requests, clarification questions, data for validation |
-| H2 | DE | SG | DE_NNN_IN | Expert responds | Review results (xlsx + narrative), clarifications, confirmations |
-| H3 | SG | (internal) | DE_NNN_SG | SG assesses response | Assessment of Domain Expert's response, contradiction analysis, action items |
+| H1 | SG | DE | DE_OUT-SG-NNN | Expert review needed | Review requests, clarification questions, data for validation |
+| H2 | DE | SG | DE_IN-DE-NNN | Expert responds | Review results, clarifications, confirmations |
 
 Note: Domain Expert never communicates with Build directly. Data flows: Domain Expert → SG (assessment) → OP (validation) → BR → EXT. See §4 for full protocol.
 
@@ -211,14 +214,14 @@ Note: Domain Expert never communicates with Build directly. Data flows: Domain E
 
 | # | From | To | Document | Trigger | Content |
 |---|------|----|----------|---------|---------|
-| G1 | SYS | OP | GOV-SYS-NNN | Governance violation detected | Process violation, skipped gate, unauthorized communication — requires OP awareness |
-| G2 | OP | SYS | (manual) | OP requests audit | OP-initiated governance review of specific agent or process |
+| G1 | SYS | OP | GOV-SYS-NNN | Governance violation detected | Process violation, skipped gate, unauthorized communication — goes to OP backlog (non-blocking, SYS continues) |
+| G2 | OP | SYS | (manual) | OP requests audit or responds during GOV cycle | OP-initiated governance review, or multi-turn exchange within GOV cycle (same mechanism as PROP exchange) |
 
-Note: SYS has read-only access to all agent artifacts and wikis. SYS has **write access to UNIVERSAL** for cross-agent knowledge propagation (autonomous — no OP approval needed for wiki updates). SYS only escalates to OP for governance violations (GOV). OP only contacts SYS for audit requests.
+Note: SYS has read access to all agent artifacts and wikis. SYS has **write access to UNIVERSAL** for cross-agent knowledge propagation (autonomous). SYS only escalates to OP for governance violations (GOV). GOV items go to OP backlog — **SYS does not block on OP response.** SYS continues scheduled audits, UNIVERSAL updates, and can produce additional GOV items while prior ones are pending.
 
 ### 2.8 SG↔OP Priority Levels
 
-OP has two ongoing channels: **SG** (all scope decisions, via PROP → exchange → AUTH) and **SYS** (governance violations only, via GOV). All other agents receive OP direction through their guardian or through propagation. Initialization is one-time.
+OP has two ongoing decision channels: **SG** (all scope decisions, via PROP → exchange → AUTH) and **SYS** (governance violations, via GOV → exchange → resolution). Both support multi-turn dialogue. Both are non-blocking — agents continue other work while OP items are pending. All other agents receive OP direction through their guardian or through propagation. Initialization is one-time.
 
 The SG↔OP working exchange is the primary channel where human response time constrains the system. Priority levels signal urgency:
 
@@ -272,7 +275,7 @@ When two specifications seem to conflict, check if they operate sequentially on 
 
 ### U7: Context compression can produce confabulation
 
-After any context compression or session restart, treat your own summaries as unverified claims. A compression summary once fabricated plausible-sounding domain mappings and client validations — items that existed in zero project documents. (See U-RC-08.) Re-read actual files before citing anything from a compressed context. (Traced to: Session 2 Rule 15.)
+After any context compression or session restart, treat your own summaries as unverified claims. A compression summary once fabricated plausible-sounding domain mappings and client validations — items that existed in zero project documents. (See U-RC-08.) Re-read actual files before citing anything from a compressed context. (Traced to: seed — compression confabulation observed in early sessions.)
 
 ### U8: Existing mechanisms first — never invent new concepts when existing structures can be extended
 
@@ -284,13 +287,13 @@ Projects frequently reuse the same term for different concepts (e.g., "Phase 2" 
 
 ### U10: Propagation must be traced through ALL documents
 
-When changing any field's name, type, or semantics: grep EVERY document for EVERY reference. Changes applied at the declaration point without tracing consumption points are incomplete. Four audit rounds each found propagation gaps from the previous round. (Traced to: Session 3 Rule 11, SE Rules 05-06.)
+When changing any field's name, type, or semantics: grep EVERY document for EVERY reference. Changes applied at the declaration point without tracing consumption points are incomplete. Four audit rounds each found propagation gaps from the previous round. (Traced to: SG Rule 6, SE Rule 3.)
 
 ---
 
 ## 4. Domain Expert Interaction Protocol
 
-The Domain Expert is the external domain domain expert. Their input is authoritative on domain reasoning but must be verified against the project's data integrity rules. Interactions follow a formal protocol.
+The Domain Expert is the external domain expert. Their input is authoritative on domain reasoning but must be verified against the project's data integrity rules. Interactions follow a formal protocol.
 
 **Current Domain Expert:** [Assigned at project start].
 
@@ -345,8 +348,9 @@ Analytical and recommendation role for scope integrity. Receives issues and devi
 | SA | FND-SA-NNN | Scope findings |
 | BR | DEV-BR-NNN | Deviation notices from build interaction |
 | TG | ESC-TG-NNN | Scope-level defects from test failure triage |
-| OP | (manual) | Scope baseline, strategic decisions, directives (Francisco) |
+| OP | REQ-OP-NNN | Operator request — ad-hoc scope work, change request, question |
 | OP | AUTH-OP-NNN | Authorization / modification / override of SG proposed disposition |
+| DE | DE_IN | Domain Expert response to outstanding question |
 
 #### Outputs
 
@@ -356,6 +360,7 @@ Analytical and recommendation role for scope integrity. Receives issues and devi
 | SE | SCN-SG-NNN(-vN) | Full Scope Change Notice (only after OP authorization via AUTH-OP-NNN) |
 | SA | REJ-SG-NNN | Rejection with exact citation (only after OP authorization) |
 | SA, BR, TG | PRO-SCOPE | Validated scope propagation |
+| (archive) | SUM-SG-NNN | Exchange summary: what OP challenged, what SG refined, key reasoning. Written after AUTH received. |
 | SE | VAL-SG-NNN | Validation of applied changes |
 | SE | REV-SG-NNN | Revision request with discrepancies |
 
@@ -379,6 +384,8 @@ Analytical and recommendation role for scope integrity. Receives issues and devi
 5. **When rejecting an issue, the rejection must be as rigorous as an approval would be.** Cite exact section, explain correct interpretation, identify what the issuer missed.
 6. **Check cascade impact.** Every scope change may affect multiple documents across the full specification document set. Check all cross-references before issuing an SCN.
 7. **Distinguish sequential from competing.** When two specifications seem to conflict, check if they operate sequentially on different inputs rather than competing on the same input. (Traced to: U-RC-02.)
+8. **Domain Expert requests are non-blocking.** When you produce DE_OUT, log the pending item in `pending_external.md` (what was asked, what depends on the answer) and continue processing all inbox items not affected by the outstanding question. When DE_IN arrives, incorporate the answer into the next analysis cycle. DE responses feed forward — they don't retroactively reopen completed work.
+9. **OP requests (REQ) go through the same analysis as any other input.** REQ-OP-NNN is triaged identically to FND, DEV, or ESC. OP is not a privileged input source — SG analyses the content, determines scope impact, and produces PROP through the normal PROP→AUTH exchange.
 
 #### Constraints
 
@@ -706,9 +713,9 @@ Manages all interactions with External Build. Provides scope and build-version t
 
 The following patterns have been observed in real build interactions and must be actively monitored:
 
-1. **Self-deferring spec-required items.** Build repeatedly classifies spec-required items as "deferred" or "future." Rule: Build has zero deferral authority. Every item in their deferred register gets reviewed individually against the active spec. Default: NOT ACCEPTED unless explicitly spec-deferred by an active document or by OP. (Traced to: Rule 3. LCN parsing, multiple specification items items all improperly deferred.)
+1. **Self-deferring spec-required items.** Build repeatedly classifies spec-required items as "deferred" or "future." Rule: Build has zero deferral authority. Every item in their deferred register gets reviewed individually against the active spec. Default: NOT ACCEPTED unless explicitly spec-deferred by an active document or by OP. (Traced to: seed — observed in build interactions, multiple specification items all improperly deferred.)
 
-2. **Modifying test expectations to match implementation.** Most dangerous pattern. Build changes expected outputs, queries, or data to make tests pass rather than fixing the implementation. Under V-Model separation, build should never see expected outputs — but watch for subtler forms: changing preconditions, filtering data, reinterpreting inputs. (Traced to: Rule 5. seed — multiple incidents of test expectation manipulation.)
+2. **Modifying test expectations to match implementation.** Most dangerous pattern. Build changes expected outputs, queries, or data to make tests pass rather than fixing the implementation. Under V-Model separation, build should never see expected outputs — but watch for subtler forms: changing preconditions, filtering data, reinterpreting inputs. (Traced to: seed — multiple incidents of test expectation manipulation.)
 
 3. **Silent reliance on mocks.** MagicMock and similar patterns make tests pass without testing anything. Any test result where mock framework patterns (e.g., `MagicMock|unittest.mock|@patch|@mock` in Python) appears in the validation test suite is invalid. (Traced to: U-RC-13 — tests passing while testing nothing.)
 
@@ -725,6 +732,10 @@ The following patterns have been observed in real build interactions and must be
 9. **Use factual questions with specific scope.** Numbered Q&A format (Q1–Q16 style), one fact per question, pointing to exact implementation detail, works well. Open-ended requests get vague answers.
 
 10. **Track the V-Model separation contract.** Build receives: spec documents + test inputs (via Test Execution Guide). Build reports: actual outputs per test ID in structured format. We compare. Build never sees expected outputs until after reporting actuals.
+
+11. **Track every outbound request and follow up on gaps.** Log every request item in `pending_build.md`. When EXT responds, cross-check the response against the original request items. Mark delivered items as resolved (remove from pending_build.md, log in log.md). Carry forward undelivered items — include them in the next BRP with explicit "still outstanding" framing. Partial responses are the norm: build answers 3 of 5 questions, submits results for some but not all components. Do not assume partial silence means compliance or refusal. Follow up until every item has an explicit response or OP directs otherwise.
+
+12. **Build interactions are non-blocking.** When BRP is sent, continue processing all other inbox items not dependent on the response. BRQ arrives when it arrives — feed into next cycle. Same principle as SG with DE (D-ARCH-032).
 
 #### Constraints
 
@@ -765,7 +776,7 @@ Formal verification gate. Compares actual build results against the full test mo
 
 #### Behavioral Rules
 
-1. **A test can pass for the wrong reason.** 100% does not mean the implementation is correct. If build demoted 53 aliases to make contamination tests pass instead of implementing disambiguation_rule, the tests pass but the spec is not implemented. When reviewing results, check not just the output but the mechanism that produced it. (Traced to: a prior validation review — "Not accepted as Phase 1 pass" despite 100% rate.)
+1. **A test can pass for the wrong reason.** 100% does not mean the implementation is correct. If build altered test data or simplified logic to make tests pass instead of implementing the required behavior, the tests pass but the spec is not implemented. When reviewing results, check not just the output but the mechanism that produced it. (Traced to: a prior validation review — "Not accepted as Phase 1 pass" despite 100% rate.)
 
 2. **Verify no mocks in test execution.** If TSR-BR-NNN includes test results from a suite containing MagicMock patterns, flag the entire suite as unreliable. Request mock audit grep results as a prerequisite for validation.
 
@@ -972,13 +983,13 @@ These make the loop's learning mechanism explicit:
 
 | Agent | Role-specific pages |
 |-------|-------------------|
-| SG | `decisions.md` (project decisions log), `cascade_patterns.md` (cross-document impact patterns), `scn_log.md` (SCN history) |
+| SG | `decisions.md` (project decisions log), `cascade_patterns.md` (cross-document impact patterns), `scn_log.md` (SCN history), `pending_external.md` (pending DE questions and their dependencies — only open items, resolved items go to log.md) |
 | SA | `spec_knowledge.md` (interpretation subtleties), `audit_methodology.md` (what to check in what order) |
 | SE | `application_patterns.md` (formatting conventions, version bump procedures), `discrepancy_log.md` (cases where SCN didn't match docs) |
 | TG | `traceability_matrix.md` (requirement→test mapping status), `triage_precedents.md` (past failure root causes), `test_catalog_notes.md` (fixture-level knowledge) |
 | TA | `coverage_gaps.md` (known uncovered areas), `criteria_quality.md` (patterns of bad test criteria) |
 | TE | `model_structure.md` (test numbering, file organisation), `build_version_derivation.md` (stripping procedure) |
-| BR | `build_interactions.md` (patterns, what works/doesn't), `spec_knowledge.md` (interpretation subtleties for answering questions), `directive_log.md` (permanent build directives issued) |
+| BR | `build_interactions.md` (patterns, what works/doesn't), `spec_knowledge.md` (interpretation subtleties for answering questions), `directive_log.md` (permanent build directives issued), `pending_build.md` (currently-open items requested from EXT — only open items, resolved items go to log.md) |
 | BTA | `validation_trends.md` (cross-run pass/fail evolution), `pattern_alerts.md` (suspicious pass patterns, mock audit results) |
 | SYS | `governance_findings.md` (GOV history and outcomes), `cross_agent_patterns.md` (patterns spanning multiple agents), `universal_updates_log.md` (what SYS added to UNIVERSAL and why) |
 
@@ -1055,7 +1066,7 @@ Companion document to PRO-TEST-BUILD. Defines:
 
 ## 8. SCN / TCN Format Reference
 
-> **Note:** The format below is an informational template derived from a production SCN (41 items, 14 decisions). At project initialization, Scope Guardian defines and documents the project-specific SCN format as one of its first responsibilities. This format must be validated by OP and maintained as the project evolves. TCN format is analogous.
+> **Note:** The format below is an informational template derived from production experience. At project initialization, Scope Guardian defines and documents the project-specific SCN format as one of its first responsibilities. This format must be validated by OP before use, and maintained as the project evolves. TCN format is analogous.
 
 ### SCN Structure (informational template)
 
@@ -1227,7 +1238,11 @@ Analogous to SCN but for test models:
 | D-ARCH-028 | Strip script is TE's internal tool | TE owns the strip mechanism. TG validates the outcome independently without knowing or prescribing the method — same actor-critic pattern as SG/SE. TA can audit TE's methods including the script. |
 | D-ARCH-029 | TA receives PRO-SCOPE for independent audit | TA derives its own view of what needs testing from scope (top-down + bottom-up), then compares against TG's test model. TA audits the scope, not TG's decomposition. This breaks the chicken-and-egg: TA's framework is the scope, not TG's structure. |
 | D-ARCH-030 | Authority hierarchy: Sources > Role > Own wiki > UNIVERSAL > Session | Strict hierarchy. On contradiction, higher layer wins. Agent follows higher layer, flags contradiction, OP resolves. |
-| D-ARCH-031 | SYS UNIVERSAL writes with exclusion mechanism | SYS writes to UNIVERSAL autonomously. If new rule contradicts an agent's role/wiki: publish with exclusion tag + GOV to OP. After OP resolves: SYS removes exclusion, adds agent-addressed correction. Agent self-corrects at next session. SYS verifies via log.md. |
+| D-ARCH-031 | SYS UNIVERSAL writes with exclusion mechanism | SYS writes to UNIVERSAL autonomously. If new rule contradicts an agent's role/wiki: publish with exclusion tag + GOV to OP. After OP resolves: SYS removes exclusion, adds agent-addressed correction. Agent self-corrects at next session. SYS verifies via log.md. Exclusion metadata format is strict (SYS must follow exactly): heading, then `excluded_for: [AGENT_CODE, ...]`, then `gov_reference: GOV-SYS-NNN`, then `---` separator, then content. This order is required — the orchestrator's exclusion filter depends on this structure. |
+| D-ARCH-032 | No agent blocks on external responses | OP, Domain Expert, and External Build are external parties. When an agent sends an outbound request (PROP, GOV, DE_OUT, BRP), it logs the pending item and continues all work not dependent on the response. Responses feed into the next cycle. |
+| D-ARCH-033 | REQ artifact type for OP→SG | Ad-hoc operator input to SG. Triaged identically to FND/DEV/ESC. OP is not a privileged input source — SG may recommend rejecting OP's own request. |
+| D-ARCH-034 | SYS↔OP dialogue via GOV cycle | SYS produces GOV → goes to OP backlog (non-blocking). OP can engage in multi-turn exchange with SYS (same mechanism as PROP cycle). Closes on /resolve. SYS continues other work while GOV is pending. |
+| D-ARCH-035 | DE non-blocking with pending tracking | SG logs DE_OUT in pending_external.md (what was asked, what depends on it). Continues all work not dependent on the answer. DE_IN feeds into next analysis cycle. |
 
 ---
 
@@ -1333,13 +1348,13 @@ The handoff document is saved as `HANDOFF-[ROLE]-S[NNN].md` and becomes part of 
 
 ### Initialisation Sequence
 
-1. OP provides initial scope to SG and SA.
-2. SG reads, analyses, establishes baseline. Sets scope version.
-3. SA reads, performs initial audit, submits FND-SA-NNN findings.
-4. SG processes findings, produces SCN if needed, completes validation cycle.
-5. SG propagates PRO-SCOPE to TG and BR.
+1. OP provides initial scope/project information to SG only.
+2. SG analyses, produces PROP-SG-001 → OP.
+3. OP↔SG exchange → AUTH-OP-001 → SG writes SUM-SG-001.
+4. SG propagates PRO-SCOPE → SA, BR, TG, TA.
+5. SA, TG begin their work from PRO-SCOPE (same as every subsequent update).
 6. TG derives initial test model, propagates PRO-TEST-FULL to TA and BTA, PRO-TEST-BUILD to BR.
-7. System is operational. Build can begin.
+7. System is operational. No special init mode — all agents receive scope through normal propagation.
 
 ### Decision Numbering
 
@@ -1353,11 +1368,9 @@ Role-prefixed sequences. No shared namespace. No coordination needed.
 
 Each agent maintains its own counter. Namespaces cannot collide. Cross-references use the full prefixed ID: "TD04 derives from D83."
 
-Historical note: pre-architecture decisions D01–D80 are all scope decisions. SG inherits the sequence.
-
 ### Unofficial Sessions Warning
 
-Only documents from the official governance loop (SG → SE → validated, or TG → TE → validated) are authoritative. Documents from unofficial or exploratory sessions may be used for structural inspiration only — never for D-number assignments, version verification, or content correctness. (Traced to: SG Rule 11.)
+Only documents from the official governance loop (SG → SE → validated, or TG → TE → validated) are authoritative. Documents from unofficial or exploratory sessions may be used for structural inspiration only — never for D-number assignments, version verification, or content correctness. (Traced to: seed — unofficial documents used for version verification in early sessions.)
 
 ### Document Manifest
 
@@ -1365,18 +1378,66 @@ SG maintains the current document manifest (included in every PRO-SCOPE):
 
 ```
 DOCUMENT MANIFEST — [date]
-scope specification.2
-Technical Scope of Work [current version]
-Client API Specifications v3.5
-data specification v1.1
-Phase 2 Implementation Configuration v1.1
-Internal DB Construction Tooling v1.0
-Build Strategy
-open issues register
-Session Handoff Consolidated
-Project Overview
-Product Level Walkthrough
-Specification Change History
-Project Audit Archive
-Domain Expert Answers Gap Analysis
+[List all active specification documents with current version numbers]
+[Project-specific — populated at initialization]
+[Each document in the manifest is subject to SCN governance]
 ```
+
+---
+
+## 12. Agent Context Views
+
+The full framework document is ~30k tokens. Not all agents need all of it. Context loading is tiered by role to minimize token cost while ensuring each agent has what it needs.
+
+### 12.1 Framework Summary (loaded for: SA, TA, BR, BTA)
+
+VEGA is a 9-agent governance system organized in two V-model lanes (scope and test) connected through a build execution layer, with a System Auditor providing governance oversight.
+
+**Agents:**
+- Scope lane: SG (guardian — analyses, proposes, issues SCNs), SA (auditor — independent scope verification), SE (editor — applies scope changes)
+- Test lane: TG (guardian — derives test models, triages failures), TA (auditor — independent test verification), TE (editor — applies test changes)
+- Build layer: BR (build rep — manages all external build interaction), BTA (build test auditor — formal pass/fail gate)
+- Governance: SYS (system auditor — cross-agent oversight, UNIVERSAL maintenance)
+
+**Key principles:**
+- Generators don't evaluate their own output; evaluators don't generate what they evaluate
+- One human decision channel: OP decides through SG (via PROP → exchange → AUTH)
+- SYS reports governance violations to OP (via GOV → exchange → /resolve)
+- Five-layer authority: Sources > Role definitions > Own wiki > UNIVERSAL > Session
+- No agent blocks on external responses (D-ARCH-032)
+- Every artifact routes through the routing table — the interaction catalog is the single source of truth
+- Archive is immutable — never modified after write
+
+**Division of authority:** OP governs the framework. SG governs scope documents. SYS audits governance compliance.
+
+### 12.2 Guardian Framework View (loaded for: SG, TG — ~12k tokens)
+
+Sections loaded for guardians as cacheable context:
+- §1 Document Types — artifact type vocabulary
+- §2 Interaction Catalog — full routing knowledge
+- §9 Interaction Flows — process understanding (triage destinations, validation paths)
+- §10 Decision Log — D-ARCH-NNN references for analysis
+- Project Addendum (if present) — domain context (SG only; TG receives addendum only if project-specific test decomposition requires domain knowledge)
+
+Guardians analyse, triage, and decide. They need the interaction catalog and flows to route correctly (SG: FND→PROP→SCN vs REJ; TG: TFR→TRI vs ESC vs TCN). Summary alone isn't sufficient for triage decisions.
+
+SG and TG do NOT receive: other agents' detailed role definitions (§5.2-5.9 except their own), wiki schema details (§6), test model format (§7), SYS-specific protocol (§8).
+
+### 12.3 SYS Framework View (~18k tokens)
+
+Sections loaded for SYS as cacheable context:
+- §1 Document Types
+- §2 Interaction Catalog (full — SYS audits all interactions)
+- §5 All Role Definitions (SYS checks role compliance)
+- §10 Decision Log
+
+SYS does NOT receive: test model format (§7), SCN/TCN templates (§8).
+
+### 12.4 Minimal View (loaded for: SE, TE)
+
+System prompt only — no additional framework context:
+- §5.X own role definition (embedded in system prompt)
+- §1 Document type codes (embedded in system prompt)
+- §2 own interaction rows only (embedded in system prompt)
+
+SE and TE execute precisely. Extra architectural context risks over-reasoning about governance instead of applying changes.
