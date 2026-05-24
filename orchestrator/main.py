@@ -150,10 +150,43 @@ class Orchestrator:
             if self.bot.app is not None:
                 break
 
+        # MCP server (Spec v4 §12.1-12.2) — same-process HTTP endpoint that
+        # exposes orchestrator tools to any Claude session. Disabled by default;
+        # enable via config.MCP_ENABLED = True.
+        mcp_server = None
+        if getattr(config, "MCP_ENABLED", False):
+            try:
+                from mcp_server import MCPServer, MCPTools
+                tools = MCPTools(
+                    config=config,
+                    op_backlog=self.op_backlog,
+                    store=self.store,
+                    cycles=self.cycles,
+                    wiki=self.wiki,
+                    instances=self.instances,
+                    models_mgr=self.models,
+                    sequences=self.sequences,
+                    sys_trigger=self.executor.execute_sys,
+                    agent_retry=self._retry_agent,
+                    agent_pause=self._pause_agent,
+                    agent_resume=self._resume_agent,
+                    process_disposition=self.bot.process_disposition,
+                    state_dir=config.STATE_DIR,
+                    router=self.router,
+                )
+                mcp_server = MCPServer(config=config, tools=tools)
+                await mcp_server.start()
+            except Exception as e:
+                print(f"[main] MCP server failed to start: "
+                      f"{type(e).__name__}: {e}. Telegram-only mode.",
+                      flush=True)
+                mcp_server = None
+
         await self.bot.send(
             "🚀 *VEGA orchestrator started.*\n"
             f"Project: `{getattr(config, 'PROJECT_NAME', '?')}`\n"
             f"Agents: {', '.join(config.AGENTS)}\n"
+            f"MCP: {'enabled' if mcp_server else 'off'}\n"
             "Type /help for commands."
         )
 
@@ -180,6 +213,11 @@ class Orchestrator:
                 await asyncio.sleep(config.POLL_INTERVAL)
         finally:
             bot_task.cancel()
+            if mcp_server is not None:
+                try:
+                    await mcp_server.stop()
+                except Exception:
+                    pass
 
     def _request_stop(self) -> None:
         self._stopping = True
@@ -425,11 +463,14 @@ def _generate_system_prompts() -> None:
     """
     framework_dir = Path(getattr(config, "FRAMEWORK_DIR",
                                  Path(config.BASE_DIR) / "framework"))
-    framework_md = framework_dir / "VEGA_Architecture_Framework_v4.md"
+    # Prefer v5; fall back to v4 for back-compat with older deployments.
+    framework_md = framework_dir / "VEGA_Architecture_Framework_v5.md"
     if not framework_md.exists():
-        print(f"[init] WARNING — framework not found at {framework_md}. "
-              "System prompts will NOT be generated. Place the framework at "
-              "that path and re-run with --init-only.")
+        framework_md = framework_dir / "VEGA_Architecture_Framework_v4.md"
+    if not framework_md.exists():
+        print(f"[init] WARNING — framework not found in {framework_dir} "
+              "(looked for v5 then v4). System prompts will NOT be generated. "
+              "Place the framework markdown there and re-run with --init-only.")
         return
 
     framework_text = framework_md.read_text()
