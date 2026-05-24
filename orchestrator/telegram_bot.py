@@ -214,6 +214,8 @@ class TelegramBot:
         app.add_handler(CommandHandler("models", self._cmd_models))
         app.add_handler(CommandHandler("build", self._cmd_build_relay))
         app.add_handler(CommandHandler("expert", self._cmd_expert_relay))
+        app.add_handler(CommandHandler("request", self._cmd_request))
+        app.add_handler(CommandHandler("resolve", self._cmd_resolve))
         app.add_handler(CommandHandler("routing", self._cmd_routing))
         app.add_handler(CommandHandler("decisions", self._cmd_decisions))
         app.add_handler(CommandHandler("framework", self._cmd_framework))
@@ -547,15 +549,76 @@ class TelegramBot:
         await self._reply(update, f"📥 {artifact_id} relayed to BR.")
 
     async def _cmd_expert_relay(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Spec v4 §12.4 — OP relays Domain Expert response to SG via router.
+
+        Was: direct inbox.deliver bypass that never reached the archive or
+        routing_log, leaving DE_IN artifacts off the audit trail and using
+        a non-spec id format (`DE-IN-<epoch>`). Now mints a proper
+        DE_IN-DE-NNN id via SequenceManager and routes through router so the
+        artifact appears in routing_log + archive like every other artifact.
+        Also fires cycle-event detection so the DE Q&A cycle (Spec v4 §6.1)
+        closes when DE_IN arrives.
+        """
         msg = " ".join(ctx.args).strip()
         if not msg:
             await self._reply(update, "Usage: `/expert <msg>`")
             return
+        if self.router is None:
+            await self._reply(update, "Router not wired — cannot relay.")
+            return
         from models import Artifact as A
-        artifact = A(type="DE_IN", sender="DE", content=msg, recipient="SG")
-        artifact.id = f"DE-IN-{int(datetime.now(timezone.utc).timestamp())}"
-        self.store.inbox("SG").deliver(artifact)
-        await self._reply(update, "Relayed to SG.")
+        artifact_id = await self.sequences.next_id("DE", "DE_IN")
+        artifact = A(type="DE_IN", sender="DE", content=msg, recipient="SG",
+                     id=artifact_id)
+        # DE Q&A cycle closes on DE_IN (Spec v4 §6.1).
+        self.cycles.check_cycle_events(artifact, recipients=["SG"])
+        await self.router.route(artifact)
+        await self._reply(update, f"📥 {artifact_id} relayed to SG.")
+
+    async def _cmd_resolve(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Spec v4 §6.1 + §12.2 — close an active GOV exchange.
+
+        Usage: /resolve <GOV-ID> [action-description]
+
+        Records the resolution in OP backlog (moves GOV from pending →
+        resolved with the action note) and closes the gov_exchange cycle so
+        the conversation history stops growing.
+        """
+        if not ctx.args:
+            await self._reply(update, "Usage: `/resolve <GOV-ID> [action]`")
+            return
+        gov_id = ctx.args[0]
+        action = " ".join(ctx.args[1:]).strip() or "acknowledged"
+        path = self.op_backlog.find(gov_id)
+        if not path:
+            await self._reply(update, f"No backlog item for {gov_id}")
+            return
+        # Move GOV to resolved (op_backlog.resolve handles pending→resolved)
+        self.op_backlog.resolve(gov_id)
+        # Close the gov_exchange cycle opened on this GOV (Spec v4 §6.1).
+        self.cycles.close_by_artifact(gov_id)
+        await self._reply(
+            update,
+            f"✅ {gov_id} resolved ({action}). gov_exchange cycle closed."
+        )
+
+    async def _cmd_request(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Spec v4 §12.2 + §2.1 S13 — OP submits ad-hoc scope work to SG as
+        REQ-OP-NNN. Routes through router for archive + routing_log."""
+        msg = " ".join(ctx.args).strip()
+        if not msg:
+            await self._reply(update,
+                "Usage: `/request <ad-hoc scope work / change request / question>`")
+            return
+        if self.router is None:
+            await self._reply(update, "Router not wired — cannot route REQ.")
+            return
+        from models import Artifact as A
+        artifact_id = await self.sequences.next_id("OP", "REQ")
+        artifact = A(type="REQ", sender="OP", content=msg, recipient="SG",
+                     id=artifact_id)
+        await self.router.route(artifact)
+        await self._reply(update, f"📨 {artifact_id} submitted to SG.")
 
     async def _cmd_routing(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         from router import ROUTING_TABLE
@@ -604,12 +667,14 @@ class TelegramBot:
         No arg → returns the table of contents.
         """
         section = " ".join(ctx.args).strip()
-        framework_path = (
-            Path(self.config.FRAMEWORK_DIR) / "VEGA_Architecture_Framework_v4.md"
-        )
+        framework_dir = Path(self.config.FRAMEWORK_DIR)
+        # Prefer v5; fall back to v4 for older deployments.
+        framework_path = framework_dir / "VEGA_Architecture_Framework_v5.md"
+        if not framework_path.exists():
+            framework_path = framework_dir / "VEGA_Architecture_Framework_v4.md"
         if not framework_path.exists():
             await self._reply(update,
-                f"Framework not found at `{framework_path}`.")
+                f"Framework not found in `{framework_dir}` (looked for v5/v4).")
             return
         text = framework_path.read_text()
 
@@ -642,27 +707,38 @@ class TelegramBot:
     # ─── Free-text → SG exchange ─────────────────────────────────────────────
 
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Multi-turn exchange routing. Per Spec §10.2."""
+        """Spec v4 §10.2 + §6.1 prop_exchange — multi-turn OP↔SG dialogue.
+
+        Free-text from OP during an active PROP exchange routes through the
+        router (audit MEDIUM Fix 2) so the continuation turn is archived and
+        appears in routing_log like every other artifact. The PROP-OP-NNN
+        artifact's references field points to the original PROP so SG's
+        executor picks up the active cycle via get_active_cycle, and the
+        cycle's messages array carries the conversation history.
+        """
         in_progress = self.op_backlog.list_in_progress()
         if not in_progress:
             await self._reply(update,
                 "No active exchange. Use /pending to see queue, /help for commands."
             )
             return
-        # Forward as an OP message inside the PROP cycle to SG
+        if self.router is None:
+            await self._reply(update, "Router not wired — cannot forward.")
+            return
         current = in_progress[0]
         text = update.message.text
         from models import Artifact as A
+        artifact_id = await self.sequences.next_id("OP", "PROP")
         exchange_msg = A(
-            type="PROP",  # continues the PROP cycle; SG sees OP turn
+            type="PROP",
             sender="OP",
             recipient="SG",
             content=f"OP exchange message (re: {current.id}):\n\n{text}",
             references=[current.id],
-            id=f"PROP-EXCH-OP-{int(datetime.now(timezone.utc).timestamp())}",
+            id=artifact_id,
         )
-        self.store.inbox("SG").deliver(exchange_msg)
-        await self._reply(update, "↩️ Forwarded to SG.")
+        await self.router.route(exchange_msg)
+        await self._reply(update, f"↩️ {artifact_id} forwarded to SG.")
 
     # ─── Thinking lookup ─────────────────────────────────────────────────────
 
@@ -737,6 +813,8 @@ _HELP_TEXT = """*VEGA OP commands*
 *External*
 `/build <msg>` — forward to BR
 `/expert <msg>` — forward to SG (Domain Expert response)
+`/request <msg>` — submit ad-hoc scope request to SG (REQ-OP-NNN)
+`/resolve <GOV-ID> [action]` — close active GOV exchange with SYS
 
 *Reference*
 `/routing <TYPE>` — where a type routes

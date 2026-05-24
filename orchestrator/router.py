@@ -62,12 +62,30 @@ ROUTING_TABLE: dict[tuple[str, ...], list[dict[str, str]]] = {
     # Routing through the table ensures archive + routing_log inclusion.
     ("EXT", "BRQ"):           [{"to": "BR"}],
 
+    # Domain Expert (Spec v4 §2.6 + §4.1) — both directions go through router.
+    # DE_IN arrives via OP /expert relay (Spec §12.4); routing here guarantees
+    # archive + routing_log instead of a silent direct-inbox bypass.
+    ("DE",  "DE_IN"):         [{"to": "SG"}],
+
     # System Auditor (§2.7)
     ("SYS", "GOV"):           [{"to": "OP"}],
 
     # AUTH from OP (Spec §7.2, §13 step 4) — archived immutably and delivered to SG.
     # Routing through the table ensures appearance in routing_log + artifacts/archive.
     ("OP",  "AUTH"):          [{"to": "SG"}],
+
+    # Operator Request (Spec v4 §2.1 S13 + §4.1) — ad-hoc scope work / change
+    # request / question from OP to SG. Triggered by /request or vega_request.
+    ("OP",  "REQ"):           [{"to": "SG"}],
+
+    # PROP exchange continuation (Spec v4 §6.1 prop_exchange).
+    # During an active PROP exchange cycle, free-text OP messages from
+    # Telegram (or vega_exchange) are minted as PROP-OP-NNN turns and
+    # routed to SG. The cycle's messages array carries the conversation
+    # context; the artifact is the inbox trigger that lets SG execute on
+    # the next tick. Without a routing entry the artifact would hit
+    # _handle_unknown and auto-GOV the exchange.
+    ("OP",  "PROP"):          [{"to": "SG"}],
 }
 
 

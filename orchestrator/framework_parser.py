@@ -2,10 +2,12 @@
 Framework markdown parsing utilities.
 
 Extracts sections by number (e.g., "5.1", "10") and D-ARCH decision rows from
-the Framework v4 markdown. Used by:
+the Framework v5 markdown. Used by:
   - telegram_bot._cmd_framework — show a section to OP on demand
   - main.initialize_project — extract role definitions to seed agent
     system_prompt.md files (Spec §14 step 2)
+  - executor._load_framework_view — Spec v4 §5.3 + Framework v5 §12 tiered
+    context loading per agent role (Guardian/SYS/Summary/Minimal)
 """
 
 from __future__ import annotations
@@ -65,6 +67,63 @@ AGENT_TO_SECTION = {
     "BTA": "5.8",
     "SYS": "5.9",
 }
+
+
+# ─── Tiered Framework Context (Framework v5 §12, Spec v4 §5.3) ───────────────
+#
+# Per-agent context view. Loading the full ~30k-token framework into every
+# agent's context wastes tokens (SE/TE only need their role) and risks
+# over-reasoning about governance instead of executing. The tiered view loads
+# only what each agent needs:
+#
+#   Guardian (SG, TG)  — §1 + §2 + §9 + §10 + project addendum (~12k tokens)
+#   SYS                — §1 + §2 + §5 + §10                     (~18k tokens)
+#   Summary (SA/TA/BR/BTA) — Framework §12.1 prose summary       (~2k tokens)
+#   Minimal (SE, TE)   — nothing (system prompt is enough)
+#
+AGENT_TIER: dict[str, str] = {
+    "SG":  "guardian",
+    "TG":  "guardian",
+    "SYS": "sys",
+    "SA":  "summary",
+    "TA":  "summary",
+    "BR":  "summary",
+    "BTA": "summary",
+    "SE":  "minimal",
+    "TE":  "minimal",
+}
+
+# Sections loaded per tier. Order matters for prompt-cache stability.
+TIER_SECTIONS: dict[str, list[str]] = {
+    "guardian": ["1", "2", "9", "10"],
+    "sys":      ["1", "2", "5", "10"],
+    # summary tier is handled separately — pulls §12.1 as a single block.
+    "summary":  ["12.1"],
+    # minimal tier loads no framework context.
+    "minimal":  [],
+}
+
+
+def load_framework_view(framework_text: str, agent_code: str,
+                        addendum_text: str = "") -> str:
+    """Return the tiered framework context for `agent_code`.
+
+    Framework v5 §12. Empty string for the minimal tier. Guardians (SG/TG)
+    additionally receive the Project Addendum (per §12.2): SG always, TG only
+    if the project's test decomposition needs domain context — at the
+    framework level we pass it for both and let the agent ignore irrelevant
+    parts (cheaper than per-project conditional loading).
+    """
+    tier = AGENT_TIER.get(agent_code, "summary")
+    sections = TIER_SECTIONS.get(tier, [])
+    chunks: list[str] = []
+    for sec in sections:
+        body = extract_section(framework_text, sec)
+        if body:
+            chunks.append(body)
+    if tier == "guardian" and addendum_text:
+        chunks.append(f"## Project Addendum\n{addendum_text}")
+    return "\n\n".join(chunks)
 
 AGENT_NAMES = {
     "SG":  "Scope Guardian",

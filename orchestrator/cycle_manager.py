@@ -4,15 +4,17 @@ Conversation cycle management.
 Per Spec §6. A cycle is a bounded multi-turn interaction whose messages array provides
 conversational coherence across executions. The array is discarded when the cycle closes.
 
-Cycle types (Spec §6.1):
+Cycle types (Spec v4 §6.1):
   scn_application   SG ↔ SE   opens on SCN, closes on VAL
-  tcn_application   TG ↔ TE   opens on TCN, closes on VAL(certificate=second)
+  tcn_application   TG ↔ TE   opens on TCN, closes on VAL(certificate=build)
   prop_exchange     SG ↔ OP   opens on PROP, closes on AUTH
   triage            TG int.   opens on TFR, closes on TRI/ESC/TCN
   build_scope_qa    BR ↔ EXT  opens on PRO-SCOPE@BR, closes on VR or supersession
   build_test_qa     BR ↔ EXT  opens on PRO-TEST-BUILD@BR, closes on VR or supersession
   build_results     BR ↔ EXT  opens on BRQ-results, closes on VR relayed
   build_remediation BR ↔ EXT  opens on TRI relayed to EXT, closes on new results
+  de_qa             SG ↔ DE   opens on DE_OUT-SG-NNN, closes on DE_IN
+  gov_exchange      SYS ↔ OP  opens on GOV-SYS-NNN, closes on /resolve
 """
 
 from __future__ import annotations
@@ -155,9 +157,14 @@ class CycleManager:
             self.open_cycle("tcn_application", artifact, ["TG", "TE"], primary_agent="TG")
             return
 
-        # VAL from TG: only the second certificate closes the cycle
+        # VAL from TG: only the build certificate closes the cycle.
+        # Spec v4 §6.1 + Framework v5 §1: TG VAL carries certificate ∈ {full, build}.
+        #   full  = approves the test model (TE generates build version next).
+        #   build = approves the build-version test model (cycle closes).
+        # "second" is preserved as an alias for back-compat with older
+        # artifacts in the archive from before the v4 renaming.
         if t == "VAL" and s == "TG":
-            if artifact.certificate == "second":
+            if artifact.certificate in {"build", "second"}:
                 cycle = self.get_cycle_by_participants("TG", "TE")
                 if cycle:
                     self.close_cycle(cycle)
@@ -220,6 +227,38 @@ class CycleManager:
                 cycle = self.get_active_by_type(cycle_type)
                 if cycle:
                     self.close_cycle(cycle)
+            return
+
+        # DE Q&A cycle (Spec v4 §6.1) — opens on DE_OUT-SG-NNN, closes on DE_IN.
+        # Per D-ARCH-035 SG is non-blocking on DE: many DE_OUT can be in flight,
+        # so cycle id includes the opening artifact id (already done in
+        # open_cycle) and DE_IN matches via the references field.
+        if t == "DE_OUT" and s == "SG":
+            self.open_cycle("de_qa", artifact, ["SG", "DE"], primary_agent="SG")
+            return
+        if t == "DE_IN" and s == "DE":
+            ref_target = (artifact.references or [None])[0]
+            closed = False
+            if ref_target:
+                expected_id = f"de_qa-{ref_target}"
+                for active in self._all_active():
+                    if active.id == expected_id:
+                        self.close_cycle(active)
+                        closed = True
+                        break
+            if not closed:
+                # Fallback: no references field → close the oldest active de_qa.
+                cycle = self.get_active_by_type("de_qa")
+                if cycle:
+                    self.close_cycle(cycle)
+            return
+
+        # GOV exchange cycle (Spec v4 §6.1) — opens on GOV-SYS-NNN. Closes
+        # explicitly via /resolve → close_by_artifact (so OP can have a
+        # multi-turn dialogue with SYS across audits before resolving).
+        if t == "GOV" and s == "SYS":
+            self.open_cycle("gov_exchange", artifact, ["SYS", "OP"],
+                            primary_agent="SYS")
             return
 
     # ─── Cycle continuation context monitoring ───────────────────────────────

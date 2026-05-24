@@ -136,7 +136,11 @@ class AgentExecutor:
         wiki_content, entries_included = self.wiki.read_all(agent_code)
         universal = self.wiki.read_universal(agent_code)
         scope = self._load_scope(agent_code)
-        framework = self._load_framework()   # Framework v4 + Manifesto + Spec + Addendum
+        # Framework v5 §12 + Spec v4 §5.3 — tiered context per role.
+        # Minimal tier (SE/TE) receives only their system prompt; the full
+        # framework would risk over-reasoning about governance instead of
+        # executing scope/test changes precisely.
+        framework = self._load_framework_view(agent_code)
 
         static_content = self._compose_static(
             wiki_content=wiki_content,
@@ -644,6 +648,58 @@ class AgentExecutor:
                     continue
         return "\n\n".join(chunks)
 
+    def _load_framework_view(self, agent_code: str) -> str:
+        """Framework v5 §12 + Spec v4 §5.3 — return the tiered view for this
+        agent. Minimal-tier agents (SE/TE) receive an empty string; other
+        tiers receive the relevant section excerpts. Project Addendum is
+        attached for guardians (SG/TG) per §12.2.
+
+        Falls back to loading the entire framework if the version isn't v5
+        (older v4 deployments lack §12 — give them the whole document so
+        they don't lose context completely)."""
+        from framework_parser import load_framework_view
+
+        framework_dir = (
+            self.config.BASE_DIR / "framework"
+            if hasattr(self.config, "BASE_DIR") else None
+        )
+        if framework_dir is None or not framework_dir.exists():
+            return ""
+
+        # Read v5 if present; if only v4 is around, fall back to legacy
+        # full-framework loader so we don't ship an empty context.
+        v5_path = framework_dir / "VEGA_Architecture_Framework_v5.md"
+        if not v5_path.exists():
+            return self._load_framework()
+
+        framework_text = v5_path.read_text()
+
+        # Manifesto and spec are useful at all tiers above minimal — attach
+        # them after the section extracts so guardians see the full project
+        # picture and SYS keeps spec context for audits.
+        addendum_text = ""
+        for path in sorted(framework_dir.glob("VEGA_*_Project_Addendum.md")):
+            addendum_text += path.read_text() + "\n\n"
+
+        view = load_framework_view(framework_text, agent_code, addendum_text)
+        if not view:
+            # Minimal tier — system prompt is sufficient (Framework v5 §12.4).
+            return ""
+
+        # For non-minimal tiers, also include the orchestrator spec excerpt
+        # so agents know the artifact-output format (Spec v4 §5.3).
+        extras: list[str] = [view]
+        for name in (
+            "VEGA_Manifesto_v4.md",
+            "VEGA_Orchestrator_Technical_Spec_v4.md",
+            "VEGA_Orchestrator_Technical_Spec_v3.md",
+        ):
+            path = framework_dir / name
+            if path.exists():
+                extras.append(f"## {name}\n" + path.read_text())
+                break   # one spec is enough
+        return "\n\n".join(extras)
+
     def _load_framework(self) -> str:
         """Load all framework/ files: Framework v4, Manifesto, Spec, CORTEX,
         and the Project Addendum (whichever VEGA_*_Project_Addendum.md is present).
@@ -657,16 +713,22 @@ class AgentExecutor:
         if framework_dir is None or not framework_dir.exists():
             return ""
         chunks = []
-        # Fixed-name framework docs in a stable order (cache-friendly).
-        for name in [
-            "VEGA_Architecture_Framework_v4.md",
-            "VEGA_Manifesto_v4.md",
-            "VEGA_Orchestrator_Technical_Spec_v3.md",
-            "VEGA_CORTEX_Addon_Specification_v0.2_BETA.md",
+        # Prefer the newest published versions; fall back to older filenames
+        # for back-compat with deployments that haven't synced framework v5 /
+        # spec v4 yet. First match per slot wins. Stable order = cache-friendly.
+        for filename_options in [
+            ("VEGA_Architecture_Framework_v5.md",
+             "VEGA_Architecture_Framework_v4.md"),
+            ("VEGA_Manifesto_v4.md",),
+            ("VEGA_Orchestrator_Technical_Spec_v4.md",
+             "VEGA_Orchestrator_Technical_Spec_v3.md"),
+            ("VEGA_CORTEX_Addon_Specification_v0.2_BETA.md",),
         ]:
-            path = framework_dir / name
-            if path.exists():
-                chunks.append(f"## {name}\n" + path.read_text())
+            for name in filename_options:
+                path = framework_dir / name
+                if path.exists():
+                    chunks.append(f"## {name}\n" + path.read_text())
+                    break
         # Project Addendum — match VEGA_*_Project_Addendum.md
         for path in sorted(framework_dir.glob("VEGA_*_Project_Addendum.md")):
             chunks.append(f"## {path.name}\n" + path.read_text())
