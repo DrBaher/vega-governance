@@ -338,7 +338,14 @@ class TelegramBot:
             return
         lines = [f"*Routing history — {artifact_id}*"]
         for e in relevant:
-            lines.append(f"• {e['timestamp']}: {e['sender']} → {', '.join(e.get('routed_to', []))}")
+            # Spec §17.2 — surface cycle_id in OP-facing routing history so
+            # operators can correlate an artifact with the cycle that drove it.
+            cycle = e.get("cycle_id")
+            cycle_suffix = f"  [cycle: {cycle}]" if cycle else ""
+            lines.append(
+                f"• {e['timestamp']}: {e['sender']} → "
+                f"{', '.join(e.get('routed_to', []))}{cycle_suffix}"
+            )
         await self._reply(update, "\n".join(lines))
 
     async def _cmd_approve(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -435,9 +442,21 @@ class TelegramBot:
         if not path.exists():
             await self._reply(update, f"No log for {code}")
             return
-        entries = path.read_text().split("\n## ")
-        recent = entries[-n:] if len(entries) > n else entries
-        await self._reply(update, "\n## ".join(recent)[:3500])
+        # WikiManager.append_log writes entries starting with
+        # `## [YYYY-MM-DD HH:MM]` (line-start, bracketed timestamp). Split on
+        # that anchor instead of the bare `\n## ` substring — log content can
+        # contain `## ` naturally (e.g., a WIKI_REPLACE entry that quotes a
+        # new section heading like `## SectionTitle` would mis-split).
+        text = path.read_text()
+        log_entry_re = re.compile(r"(?m)^## \[\d{4}-\d{2}-\d{2}")
+        matches = list(log_entry_re.finditer(text))
+        if not matches:
+            await self._reply(update, text[-3500:] or "(empty log)")
+            return
+        offsets = [m.start() for m in matches] + [len(text)]
+        entries = [text[offsets[i]:offsets[i + 1]] for i in range(len(matches))]
+        recent = entries[-n:]
+        await self._reply(update, "".join(recent)[-3500:])
 
     async def _cmd_thinking(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not ctx.args:
@@ -648,19 +667,27 @@ class TelegramBot:
     # ─── Thinking lookup ─────────────────────────────────────────────────────
 
     def _latest_thinking(self, artifact: Artifact) -> str:
+        """Look up the thinking snippet for the execution that produced this
+        artifact. Uses artifact_index.json to find the execution_id, then
+        scans the execution_log in REVERSE so the most-recently-produced
+        artifacts (the common case for notifications) are O(1) instead of
+        O(N) over the full log."""
         if not artifact.id:
             return ""
         index = load_json(self.state_dir / "artifact_index.json", default={})
         record = index.get(artifact.id)
         if not record:
             return ""
+        target = record.get("execution_id")
+        if not target:
+            return ""
         log = load_json(self.state_dir / "execution_log.json", default=[])
         if not isinstance(log, list):
             return ""
-        match = next((e for e in log if e.get("execution_id") == record["execution_id"]), None)
-        if not match:
-            return ""
-        return _thinking_snippet(match.get("thinking_blocks", []))
+        for e in reversed(log):
+            if e.get("execution_id") == target:
+                return _thinking_snippet(e.get("thinking_blocks", []))
+        return ""
 
 
 # Framework section extraction lives in framework_parser (shared with main.py).

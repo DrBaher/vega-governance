@@ -182,10 +182,15 @@ class AgentExecutor:
         log_entries: list[LogEntry] = [LogEntry(content) for _, content in parsed["LOG_ENTRY"]]
 
         # Spec §15.2 — malformed agent output handling.
-        # If response had content but NO parseable blocks: log raw, leave inbox
-        # unprocessed (next tick retries), bump consecutive counter, notify OP
-        # at 3+ strikes.
-        if not (artifacts or wiki_updates or log_entries) and full_text.strip():
+        # If the agent produced ANY signal (visible text OR thinking blocks)
+        # but no parseable ARTIFACT/WIKI_UPDATE/LOG_ENTRY blocks, that's a
+        # malformed-output strike. The earlier check looked only at
+        # `full_text.strip()`, so an empty-text response with thinking-only
+        # content (model "thought" but emitted nothing) was silently consumed
+        # — the inbox got marked processed and the malformed counter never
+        # bumped. With thinking-only included, we catch that case too.
+        produced_signal = bool(full_text.strip()) or bool(thinking_blocks)
+        if not (artifacts or wiki_updates or log_entries) and produced_signal:
             return await self._handle_malformed(agent_code, full_text, items)
 
         # Successful parse — reset consecutive counter (Spec §15.2).
@@ -200,9 +205,14 @@ class AgentExecutor:
 
         # Cycle bookkeeping
         if cycle:
-            user_msg = messages[-1] if messages else {}
+            # Use None instead of {} when there's no prior user message —
+            # an empty-dict turn would silently introduce a malformed message
+            # into the cycle history; downstream cycle-context estimation +
+            # serialization would treat it as a real turn.
+            user_msg = messages[-1] if messages else None
             assistant_msg = {"role": "assistant", "content": full_text}
-            self.cycles.append_turn(cycle, user_msg, assistant_msg)
+            if user_msg is not None:
+                self.cycles.append_turn(cycle, user_msg, assistant_msg)
             used = self.cycles.estimate_tokens(cycle.messages)
             limit = _model_context_limit(model)
             if limit and used / limit > self.config.CYCLE_CONTEXT_WARNING:
@@ -549,6 +559,15 @@ class AgentExecutor:
         return "\n\n".join(chunks)
 
     def _load_recent_execution_log(self, since: str | None) -> list[dict[str, Any]]:
+        """Return execution log entries with `timestamp > since`.
+
+        IMPORTANT INVARIANT: all timestamps in execution_log.json are ISO 8601
+        with trailing `Z` (produced by utcnow_iso() — see models.py). String
+        comparison is therefore lexicographic = chronological. If anyone ever
+        introduces timestamps with `+00:00` or naïve formats, this comparison
+        silently misorders entries (lexicographic order across mixed formats
+        is not chronological). Keep utcnow_iso() as the single producer.
+        """
         log = load_json(self.execution_log_path, default=[])
         if not isinstance(log, list):
             return []
@@ -790,12 +809,38 @@ def _build_system_param(system_prompt: str, config: Any):
     ]
 
 
+# Explicit per-model context limits (tokens). Keyed by model-id substring.
+# Update when Anthropic changes published limits or we adopt a new model.
+# Used by the cycle context-warning logic; an unrecognized model falls back
+# to the conservative DEFAULT.
+_MODEL_CONTEXT_LIMITS: dict[str, int] = {
+    "claude-opus-4-7":      1_000_000,   # Opus 4.7 (1M)
+    "claude-opus-4":          200_000,   # Opus 4.x
+    "claude-sonnet-4-7":    1_000_000,   # Sonnet 4.7 (1M)
+    "claude-sonnet-4-6":    1_000_000,   # Sonnet 4.6 (1M)
+    "claude-sonnet-4":        200_000,   # Sonnet 4.x default
+    "claude-haiku-4-5":       200_000,   # Haiku 4.5
+    "claude-3-5-sonnet":      200_000,
+    "claude-3-5-haiku":       200_000,
+    "claude-3-opus":          200_000,
+    "claude-3-sonnet":        200_000,
+    "claude-3-haiku":         200_000,
+}
+_MODEL_CONTEXT_DEFAULT = 200_000
+
+
 def _model_context_limit(model: str) -> int:
-    """Coarse map. The 40% cycle warning uses these. Update as needed."""
-    if "haiku" in model:
-        return 200_000
-    if "sonnet" in model:
-        return 200_000
-    if "opus" in model:
-        return 200_000
-    return 200_000
+    """Return the context window for a model id.
+
+    Longest-prefix-match against _MODEL_CONTEXT_LIMITS so `claude-opus-4-7`
+    correctly resolves to its 1M entry instead of being shadowed by a shorter
+    `claude-opus-4` match.
+    """
+    # Try exact match first.
+    if model in _MODEL_CONTEXT_LIMITS:
+        return _MODEL_CONTEXT_LIMITS[model]
+    # Longest-prefix match (keys sorted desc by length).
+    for key in sorted(_MODEL_CONTEXT_LIMITS, key=len, reverse=True):
+        if key in model:
+            return _MODEL_CONTEXT_LIMITS[key]
+    return _MODEL_CONTEXT_DEFAULT

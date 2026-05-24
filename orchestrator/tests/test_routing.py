@@ -80,4 +80,9 @@ def test_gov_is_op_bound():
 def test_external_targets_recognized():
     assert "EXT" in EXTERNAL_TARGETS
     assert "DE" in EXTERNAL_TARGETS
-    assert "OP" in EXTERNAL_TARGETS
+    assert "ARCHIVE" in EXTERNAL_TARGETS
+    # "OP" is intentionally NOT in EXTERNAL_TARGETS. OP routing happens before
+    # the ROUTING_TABLE loop via OP_BOUND_TYPES (SG/PROP, SYS/GOV). A "to=='OP'"
+    # branch inside the loop would be unreachable dead code; listing OP here
+    # would falsely suggest the loop handles it.
+    assert "OP" not in EXTERNAL_TARGETS

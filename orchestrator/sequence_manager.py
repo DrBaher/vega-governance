@@ -62,7 +62,20 @@ class SequenceManager:
 
 
 class InstanceManager:
-    """Per-agent instance IDs. Bumped via /rotate."""
+    """Per-agent instance IDs. Bumped via /rotate.
+
+    Invariant: get_or_create() is intentionally non-async. The orchestrator
+    pre-materializes all known agents at startup (Orchestrator.__init__ →
+    self.instances.get_or_create(code) for every agent in the registry).
+    In steady state, get_or_create() is therefore a pure read — the
+    `if agent_code not in instances` branch is dead. A race here would only
+    occur for an agent never seen at startup, which already violates the
+    pre-materialize contract.
+
+    If that invariant ever changes (e.g., dynamic agent registration), this
+    method must become async and wrap the read-modify-write in
+    `LOCKS.get(self.lock_name)` like rotate() does.
+    """
 
     def __init__(self, state_dir: str | Path) -> None:
         self.state_file = Path(state_dir) / "instance_ids.json"
@@ -88,19 +101,37 @@ class InstanceManager:
 
 
 class ModelAssignmentManager:
-    """Tracks per-agent model overrides (mutable at runtime via /model)."""
+    """Tracks per-agent model overrides (mutable at runtime via /model).
 
-    def __init__(self, state_dir: str | Path, defaults: dict[str, str]) -> None:
+    Fallback chain (Spec §9.3):
+      1. per-agent runtime override (set via /model)
+      2. per-agent default from `defaults` (typically from Project Addendum §6.1)
+      3. project-wide default (config.AGENT_MODEL, passed via project_default)
+      4. last-resort hardcoded "claude-sonnet-4-6"
+
+    The project_default param lets the orchestrator pass config.AGENT_MODEL
+    so an agent absent from `defaults` doesn't silently get the legacy
+    hardcoded model — it gets whatever the project picked.
+    """
+
+    def __init__(self, state_dir: str | Path, defaults: dict[str, str],
+                 project_default: str | None = None) -> None:
         self.state_file = Path(state_dir) / "model_assignments.json"
         self.lock_name = f"models:{self.state_file}"
         self._defaults = dict(defaults)
+        self._project_default = project_default
 
     def _load(self) -> dict[str, str]:
         return load_json(self.state_file, default={})
 
     def get(self, agent_code: str) -> str:
         overrides = self._load()
-        return overrides.get(agent_code) or self._defaults.get(agent_code, "claude-sonnet-4-6")
+        return (
+            overrides.get(agent_code)
+            or self._defaults.get(agent_code)
+            or self._project_default
+            or "claude-sonnet-4-6"
+        )
 
     async def set(self, agent_code: str, model: str) -> None:
         async with LOCKS.get(self.lock_name):

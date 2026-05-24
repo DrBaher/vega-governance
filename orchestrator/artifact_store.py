@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 from models import Artifact, PRIORITY_ORDER
@@ -18,6 +19,22 @@ from state_manager import LOCKS, atomic_write
 def _read_text(path: str | Path) -> str:
     with open(path) as f:
         return f.read()
+
+
+def _quarantine_corrupt(path: Path, err: Exception) -> None:
+    """Move a corrupt artifact file out of the active set so it doesn't
+    poison repeated scans (Spec §15.4). The corrupt copy is preserved with
+    a `.corrupt-<unix-ms>` suffix for forensic review."""
+    if not path.exists():
+        return
+    quarantine = path.with_name(f"{path.name}.corrupt-{int(time.time() * 1000)}")
+    try:
+        os.replace(path, quarantine)
+        print(f"[artifact_store] quarantined corrupt {path} → {quarantine.name} "
+              f"({type(err).__name__}: {err})", flush=True)
+    except OSError as move_err:
+        print(f"[artifact_store] could not quarantine {path}: {move_err}",
+              flush=True)
 
 
 class Inbox:
@@ -38,7 +55,11 @@ class Inbox:
             try:
                 if self._load(path).status == "unprocessed":
                     return True
-            except Exception:
+            except Exception as e:
+                # Spec §15.4 — quarantine corrupt inbox files; they'd otherwise
+                # be re-scanned every tick and swallowed silently by the bare
+                # `continue`.
+                _quarantine_corrupt(path, e)
                 continue
         return False
 
@@ -53,7 +74,8 @@ class Inbox:
         for path in self._list_files():
             try:
                 a = self._load(path)
-            except Exception:
+            except Exception as e:
+                _quarantine_corrupt(path, e)   # Spec §15.4
                 continue
             if a.status == "unprocessed":
                 artifacts.append(a)
@@ -101,7 +123,8 @@ class Outbox:
         for path in sorted(self.dir.glob("*.md")):
             try:
                 out.append(Artifact.from_markdown(_read_text(path), filename=path.name))
-            except Exception:
+            except Exception as e:
+                _quarantine_corrupt(path, e)   # Spec §15.4
                 continue
         return out
 
@@ -126,6 +149,21 @@ class Archive:
         path = self.dir / f"{artifact.id}.md"
         if path.exists():
             # Already archived (e.g., multi-recipient routing). Don't rewrite.
+            # Spec §7.4 immutability rule: the FIRST write wins. If the new
+            # artifact content differs from what's on disk, that's a SYS audit
+            # signal — log it but keep the on-disk version (silent overwrite
+            # would mask the divergence and break artifact provenance).
+            try:
+                existing = _read_text(path)
+                new_content = artifact.to_markdown()
+                if existing != new_content:
+                    print(f"[artifact_store] WARNING | Archive collision for "
+                          f"{artifact.id} — on-disk content differs from "
+                          f"incoming write; on-disk version preserved per "
+                          f"Spec §7.4 immutability rule. SYS should audit.",
+                          flush=True)
+            except OSError:
+                pass
             return path
         artifact.status = "archived"
         atomic_write(path, artifact.to_markdown())
@@ -148,7 +186,8 @@ class Archive:
         for path in sorted(self.dir.glob("*.md")):
             try:
                 a = Artifact.from_markdown(_read_text(path), filename=path.name)
-            except Exception:
+            except Exception as e:
+                _quarantine_corrupt(path, e)   # Spec §15.4
                 continue
             if since is None or a.timestamp > since:
                 out.append(a)

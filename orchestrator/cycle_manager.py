@@ -131,8 +131,12 @@ class CycleManager:
             triage = self.get_active_by_type("triage")
             if triage:
                 self.close_cycle(triage)
-            # Fall through — TCN still opens tcn_application; TRI still opens
-            # build_remediation; ESC has no follow-up cycle open.
+            # No early return — this is intentional, NOT a fall-through bug.
+            # Closing triage is a side-effect; the per-type handlers below
+            # are responsible for the *next* cycle in the chain:
+            #   - TCN → opens tcn_application (TG↔TE)
+            #   - TRI → opens build_remediation (BR↔EXT)
+            #   - ESC → terminal, no follow-up cycle opens
 
         # SCN: opens scn_application SG↔SE
         if t == "SCN" and s == "SG":
@@ -267,11 +271,16 @@ class CycleManager:
         return len(older)
 
     def close_by_artifact(self, artifact_id: str) -> None:
+        """Close the cycle opened by `artifact_id`. Used by /retry to roll back
+        a cycle when its opener is re-issued.
+
+        We match ONLY against the cycle's explicit `opening_artifact` field
+        — never against a substring scan of `messages`. The old substring
+        scan could close the wrong cycle if a later message merely *quoted*
+        the id (e.g., "rejecting SCN-SG-012" arriving as a turn body).
+        """
         for cycle in self._all_active():
-            if cycle.opening_artifact == artifact_id or artifact_id in (
-                # quick scan of any messages content for the id
-                json.dumps(cycle.messages) if cycle.messages else ""
-            ):
+            if cycle.opening_artifact == artifact_id:
                 self.close_cycle(cycle)
                 return
 

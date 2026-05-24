@@ -163,36 +163,65 @@ class WikiManager:
     def _filter_exclusions(self, content: str, agent_code: str) -> str:
         """Remove sections with `excluded_for: [..., AGENT, ...]` per D-ARCH-031.
 
-        Section format expected:
+        Section format (per UNIVERSAL_GLOSSARY §3 — metadata order-independent):
             ## U-RULE-XX: Title
-            excluded_for: [BR, TE]
-            gov_reference: GOV-SYS-005
-            ---
+            excluded_for: [BR, TE]      ← order
+            gov_reference: GOV-SYS-005  ← independent
+            ---                          ← separator is optional
             <rule body>
+
+        Implementation: split on ## headings, then parse each section's metadata
+        lines individually. Previously a single regex required excluded_for to
+        come first, silently passing rules through when authors wrote
+        gov_reference first.
         """
-        pattern = re.compile(
-            r"(?ms)^(##\s+[^\n]+\n)"
-            r"(?:excluded_for:\s*\[([^\]]*)\][^\n]*\n)?"
-            r"(?:gov_reference:\s*([^\n]+)\n)?"
-            r"(?:---\n)?"
-            r"(.*?)(?=^##\s|\Z)"
-        )
+        # Split on heading boundaries while keeping headings attached to bodies.
+        parts = re.split(r"(?m)(?=^##\s+)", content)
+        out: list[str] = []
 
-        def replace(m: re.Match[str]) -> str:
-            heading = m.group(1)
-            exclusions_raw = m.group(2) or ""
-            gov_ref = m.group(3) or ""
-            body = m.group(4)
+        for part in parts:
+            if not part.strip() or not part.startswith("## "):
+                out.append(part)
+                continue
+
+            # Header line is the first line; metadata lines follow until we hit
+            # a blank line, a `---` separator, or a non-metadata line.
+            lines = part.split("\n")
+            heading_line = lines[0]
+            meta: dict[str, str] = {}
+            body_start = 1
+
+            for i, line in enumerate(lines[1:], start=1):
+                stripped = line.strip()
+                if stripped == "---":
+                    body_start = i + 1  # consume the separator
+                    break
+                if not stripped:
+                    body_start = i + 1
+                    break
+                m = re.match(r"^(\w+):\s*(.*)$", stripped)
+                if not m:
+                    body_start = i  # first non-metadata line → start of body
+                    break
+                meta[m.group(1)] = m.group(2)
+                body_start = i + 1
+
+            exclusions_raw = meta.get("excluded_for", "")
+            # Strip [ ] if list-style.
+            exclusions_raw = exclusions_raw.strip().lstrip("[").rstrip("]")
             excluded = [s.strip() for s in exclusions_raw.split(",") if s.strip()]
-            if agent_code in excluded:
-                return (
-                    f"{heading}"
-                    f"[Rule excluded for {agent_code}"
-                    f"{f' — pending {gov_ref.strip()} resolution' if gov_ref else ''}]\n\n"
-                )
-            return m.group(0)
+            gov_ref = meta.get("gov_reference", "").strip()
 
-        return pattern.sub(replace, content)
+            if agent_code in excluded:
+                out.append(
+                    f"{heading_line}\n"
+                    f"[Rule excluded for {agent_code}"
+                    f"{f' — pending {gov_ref} resolution' if gov_ref else ''}]\n\n"
+                )
+            else:
+                out.append(part)
+
+        return "".join(out)
 
     # ─── Writes ──────────────────────────────────────────────────────────────
 
@@ -275,19 +304,27 @@ class WikiManager:
 
     async def _bump_replace_counter(self, agent_code: str) -> bool:
         """Spec §16.1 — wiki_replace_counters.json requires asyncio.Lock to avoid
-        undercount under concurrent agent executions (asyncio.gather)."""
+        undercount under concurrent agent executions (asyncio.gather).
+
+        The threshold comparison AND the THRESHOLD log emission must also live
+        inside the lock: otherwise, two concurrent calls can both observe
+        `count >= threshold` (because the post-bump value crosses the boundary
+        for both readers) and emit the THRESHOLD log twice for the same trip.
+        """
         async with LOCKS.get("wiki_replace_counters"):
             counters = load_json(self.counters_file, default={})
             count = counters.get(agent_code, 0) + 1
             counters[agent_code] = count
             atomic_save_json(self.counters_file, counters)
-        threshold = self.replace_thresholds.get(agent_code, self.replace_threshold_default)
-        if count >= threshold:
-            self.append_log(agent_code, LogEntry(
-                f"THRESHOLD | {count} replace_sections since last SYS audit — "
-                f"flagged for immediate SYS review"
-            ))
-            return True
+            threshold = self.replace_thresholds.get(
+                agent_code, self.replace_threshold_default
+            )
+            if count >= threshold:
+                self.append_log(agent_code, LogEntry(
+                    f"THRESHOLD | {count} replace_sections since last SYS audit — "
+                    f"flagged for immediate SYS review"
+                ))
+                return True
         return False
 
     def any_threshold_exceeded(self) -> bool:

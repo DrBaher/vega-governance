@@ -92,8 +92,17 @@ OP_BOUND_TYPES: dict[tuple[str, str], dict[str, Any]] = {
 
 
 # ─── External targets ────────────────────────────────────────────────────────
-
-EXTERNAL_TARGETS = {"EXT", "DE", "OP", "ARCHIVE"}
+#
+# Sentinels recognized in the ROUTING_TABLE's `to` field.
+#
+#   EXT     — external relay (BR ↔ EXT build channel, Spec §12.1)
+#   DE      — domain expert relay (SG → DE, Spec §12.2)
+#   ARCHIVE — archive-only, no recipient inbox (SG SUM)
+#
+# "OP" is NOT in this set. OP routing happens BEFORE the ROUTING_TABLE loop
+# via OP_BOUND_TYPES (SG/PROP and SYS/GOV) which calls _route_to_op directly.
+# Listing OP here would create unreachable dead code inside the loop.
+EXTERNAL_TARGETS = {"EXT", "DE", "ARCHIVE"}
 
 
 # ─── Router ──────────────────────────────────────────────────────────────────

@@ -50,8 +50,15 @@ class Orchestrator:
 
         self.sequences = SequenceManager(config.STATE_DIR)
         self.instances = InstanceManager(config.STATE_DIR)
+        # Per Spec §9.3 fallback chain: per-agent override → defaults →
+        # project-wide default (config.AGENT_MODEL) → hardcoded last resort.
+        # Passing project_default keeps agents absent from
+        # AGENT_MODEL_OVERRIDES on the project's chosen model instead of the
+        # legacy hardcoded fallback.
         self.models = ModelAssignmentManager(
-            config.STATE_DIR, defaults=config.AGENT_MODEL_OVERRIDES,
+            config.STATE_DIR,
+            defaults=config.AGENT_MODEL_OVERRIDES,
+            project_default=getattr(config, "AGENT_MODEL", None),
         )
         self.store = ArtifactStore(config.AGENTS_DIR, config.ARTIFACTS_DIR)
         self.cycles = CycleManager(config.CYCLES_DIR, config.ARTIFACTS_DIR)
@@ -251,9 +258,14 @@ class Orchestrator:
         # 4. CORTEX periodic maintenance (Spec §13 lines 1286-1289).
         # Gated — stub raises NotImplementedError; we swallow it because the
         # default deployment has CORTEX off.
+        # Cadence is configurable via CORTEX_MAINTENANCE_EVERY_N (Spec §13).
+        # The previous implementation derived it from SYS_EXECUTION_THRESHOLD
+        # // 2 which coupled two unrelated knobs — tuning the SYS audit
+        # cadence silently shifted CORTEX maintenance frequency.
+        cortex_every_n = getattr(config, "CORTEX_MAINTENANCE_EVERY_N", 10)
         if getattr(config, "CORTEX_ENABLED", False) and self.cortex is not None:
             if self._execution_count > 0 and (
-                self._execution_count % max(config.SYS_EXECUTION_THRESHOLD // 2, 1) == 0
+                self._execution_count % max(cortex_every_n, 1) == 0
             ):
                 for agent_code in config.AGENTS:
                     try:
@@ -283,12 +295,25 @@ class Orchestrator:
         atomic_save_json(self._sys_run_file, {"last_sys_run": now.isoformat()})
 
     def _load_sys_watermark(self) -> datetime | None:
+        """Load the persisted SYS run timestamp.
+
+        On parse failure (corrupt file, missing field, malformed timestamp),
+        warn loudly and return None — the next SYS run will see the full
+        history (as on the very first launch). Silent None would cause SYS
+        to silently re-audit everything every run, which is the safer
+        outcome but the operator should know the watermark is gone."""
         data = load_json(self._sys_run_file, default=None)
         if not data:
             return None
         try:
-            return datetime.fromisoformat(data.get("last_sys_run", "").replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
+            return datetime.fromisoformat(
+                data.get("last_sys_run", "").replace("Z", "+00:00")
+            )
+        except (ValueError, AttributeError) as e:
+            print(f"[main] WARNING — corrupt sys_run watermark at "
+                  f"{self._sys_run_file} ({type(e).__name__}: {e}). "
+                  f"Next SYS audit will include the full history.",
+                  flush=True)
             return None
 
     # ─── SG exchange notifications ───────────────────────────────────────────

@@ -49,12 +49,33 @@ def atomic_save_json(filepath: str | Path, data: Any) -> None:
 
 
 def load_json(filepath: str | Path, default: Any = None) -> Any:
-    """Read JSON or return default if missing/empty."""
+    """Read JSON or return default if missing/empty.
+
+    Per Spec §15.4 — on JSON decode error, quarantine the corrupt file with a
+    `.corrupt-<unix-ms>` suffix and return the default. This keeps the
+    orchestrator alive across partial-write crashes (the most common cause of
+    corruption) while preserving forensic evidence. The caller logs the event
+    via its own context.
+    """
+    import time
+
     filepath = Path(filepath)
     if not filepath.exists() or filepath.stat().st_size == 0:
         return default if default is not None else {}
-    with open(filepath) as f:
-        return json.load(f)
+    try:
+        with open(filepath) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        quarantine = filepath.with_name(
+            f"{filepath.name}.corrupt-{int(time.time() * 1000)}"
+        )
+        try:
+            os.replace(filepath, quarantine)
+        except OSError:
+            pass
+        print(f"[state_manager] load_json: quarantined corrupt {filepath} → "
+              f"{quarantine.name} ({type(e).__name__}: {e})", flush=True)
+        return default if default is not None else {}
 
 
 # ─── Lock registry ───────────────────────────────────────────────────────────
@@ -66,6 +87,12 @@ class LockRegistry:
         self._locks: dict[str, asyncio.Lock] = {}
 
     def get(self, name: str) -> asyncio.Lock:
+        # The dict insertion below is sync and safe even when called from
+        # multiple coroutines: Python's GIL makes single dict ops atomic, and
+        # asyncio runs coroutines on a single thread (no preemption between
+        # `name not in self._locks` and the assignment). If we ever moved off
+        # asyncio (e.g. to thread-per-agent), this would need an asyncio.Lock
+        # or threading.Lock around the read-modify-write.
         if name not in self._locks:
             self._locks[name] = asyncio.Lock()
         return self._locks[name]
