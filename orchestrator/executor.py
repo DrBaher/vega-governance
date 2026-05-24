@@ -686,18 +686,25 @@ class AgentExecutor:
             # Minimal tier — system prompt is sufficient (Framework v5 §12.4).
             return ""
 
-        # For non-minimal tiers, also include the orchestrator spec excerpt
-        # so agents know the artifact-output format (Spec v4 §5.3).
+        # For non-minimal tiers, also include the Manifesto AND the
+        # Orchestrator Spec so agents know the artifact-output format
+        # (Spec v4 §5.3) and SYS sees the auto-GOV reissue protocol
+        # (Spec v4 §4.3 — delta 2.13). These are two separate documents;
+        # appending only one would leave SYS blind to the spec.
         extras: list[str] = [view]
-        for name in (
-            "VEGA_Manifesto_v4.md",
-            "VEGA_Orchestrator_Technical_Spec_v4.md",
-            "VEGA_Orchestrator_Technical_Spec_v3.md",
-        ):
+
+        manifesto_path = framework_dir / "VEGA_Manifesto_v4.md"
+        if manifesto_path.exists():
+            extras.append(f"## VEGA_Manifesto_v4.md\n" +
+                          manifesto_path.read_text())
+
+        # Prefer spec v4; fall back to v3 for older deployments.
+        for name in ("VEGA_Orchestrator_Technical_Spec_v4.md",
+                     "VEGA_Orchestrator_Technical_Spec_v3.md"):
             path = framework_dir / name
             if path.exists():
                 extras.append(f"## {name}\n" + path.read_text())
-                break   # one spec is enough
+                break   # one spec version is enough
         return "\n\n".join(extras)
 
     def _load_framework(self) -> str:

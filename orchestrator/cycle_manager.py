@@ -99,9 +99,13 @@ class CycleManager:
                 return cycle
             if inbox_item.sender in cycle.participants and agent_code in cycle.participants:
                 # Heuristic — for SG↔SE etc., the pair is dedicated.
+                # de_qa and gov_exchange are included so that if a DE_IN /
+                # GOV-exchange-continuation arrives without a references
+                # field (older clients), the cycle still gets matched.
                 if cycle.type in {
                     "scn_application", "tcn_application", "prop_exchange",
                     "build_scope_qa", "build_test_qa", "build_results", "build_remediation",
+                    "de_qa", "gov_exchange",
                 }:
                     return cycle
         return None

@@ -162,7 +162,9 @@ id: <leave blank — orchestrator assigns>
 references: <comma-separated list of referenced artifact IDs>
 priority: <P0-P3, if applicable — SG PROP only>
 ref_type: <type of referenced artifact, if this is a REJ>
-certificate: <first | second, for VAL artifacts in test lane>
+certificate: <full | build, for VAL artifacts in test lane (Framework v5 §1).
+              Closes tcn_application cycle on `build` only.
+              Legacy "second" still accepted for archive replay.>
 ---
 <artifact content as markdown>
 
