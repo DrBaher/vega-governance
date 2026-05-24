@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters,
 )
@@ -113,12 +114,39 @@ class TelegramBot:
             await asyncio.sleep(3600)
 
     async def send(self, text: str) -> None:
+        """Send a message to OP. Falls back to plain text if Markdown parsing
+        fails on the artifact body (unescaped `_`, `*`, `[`, etc.). Truncates
+        anything over Telegram's 4096-char message limit, splitting at a
+        newline if possible."""
         if not self.app or not self.chat_id:
             print(f"[telegram-shim] {text}")
             return
-        await self.app.bot.send_message(
-            chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
-        )
+
+        # Telegram's hard message limit is 4096 chars.
+        MAX = 4000
+        if len(text) > MAX:
+            # Try to cut at the last newline before the limit so we don't slice
+            # mid-token; append an explicit truncation marker.
+            cut = text.rfind("\n", 0, MAX)
+            if cut < MAX // 2:
+                cut = MAX
+            text = text[:cut] + "\n\n…(truncated; full content in artifacts/archive/)"
+
+        try:
+            await self.app.bot.send_message(
+                chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
+            )
+        except BadRequest as e:
+            msg = str(e).lower()
+            if "parse" in msg or "entities" in msg or "markdown" in msg:
+                # Artifact content has chars that broke Markdown (unescaped _, *,
+                # [, etc.). Resend as plain text so the message reaches OP.
+                await self.app.bot.send_message(
+                    chat_id=self.chat_id, text=text,
+                    # parse_mode omitted → plain text
+                )
+            else:
+                raise
 
     # ─── Notifications ───────────────────────────────────────────────────────
 

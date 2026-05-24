@@ -132,8 +132,16 @@ class Orchestrator:
             except (NotImplementedError, RuntimeError):
                 pass
 
-        # Start Telegram bot
+        # Start Telegram bot — yield control so the task can initialize
+        # (otherwise the startup send below races against self.app being set,
+        # and the greeting ends up shimmed to stdout instead of Telegram).
         bot_task = asyncio.create_task(self.bot.start_polling())
+        # Give start_polling enough time to set self.app (Application.builder +
+        # initialize + start). 2.5s is generous on typical networks.
+        for _ in range(25):
+            await asyncio.sleep(0.1)
+            if self.bot.app is not None:
+                break
 
         await self.bot.send(
             "🚀 *VEGA orchestrator started.*\n"
@@ -144,7 +152,24 @@ class Orchestrator:
 
         try:
             while not self._stopping:
-                await self._tick()
+                try:
+                    await self._tick()
+                except Exception as e:
+                    # Don't let a single bad tick (e.g., a malformed artifact, a
+                    # network blip, a routing-table oversight) take down the whole
+                    # orchestrator. Log loudly and continue. The user can /pause
+                    # the offending agent if the same error repeats.
+                    import traceback
+                    err = f"{type(e).__name__}: {e}"
+                    print(f"[main] ⚠ tick failed: {err}", flush=True)
+                    traceback.print_exc()
+                    try:
+                        await self.bot.send(
+                            f"⚠️ *Tick failed* — {err}. Orchestrator continues; "
+                            f"check terminal logs for the traceback."
+                        )
+                    except Exception:
+                        pass
                 await asyncio.sleep(config.POLL_INTERVAL)
         finally:
             bot_task.cancel()

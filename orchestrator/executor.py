@@ -136,11 +136,13 @@ class AgentExecutor:
         wiki_content, entries_included = self.wiki.read_all(agent_code)
         universal = self.wiki.read_universal(agent_code)
         scope = self._load_scope(agent_code)
+        framework = self._load_framework()   # Framework v4 + Manifesto + Spec + Addendum
 
         static_content = self._compose_static(
             wiki_content=wiki_content,
             universal=universal,
             scope=scope,
+            framework=framework,
         )
         dynamic_content = self._format_inbox(items)
 
@@ -312,6 +314,7 @@ class AgentExecutor:
             wiki_content=wiki_content,
             universal=universal,
             scope="",  # SYS doesn't need scope
+            framework=framework_text,
         )
         messages = self._build_fresh_messages(static_content, inbox_content)
 
@@ -377,29 +380,52 @@ class AgentExecutor:
     async def _call_with_retry(self, model: str, system: str,
                                messages: list[dict[str, Any]],
                                max_retries: int = 3) -> tuple[Any, Optional[Exception]]:
-        for attempt in range(max_retries):
-            try:
-                kwargs: dict[str, Any] = {
-                    "model": model,
-                    "max_tokens": self.config.MAX_TOKENS,
-                    "system": _build_system_param(system, self.config),
-                    "messages": messages,
-                }
-                if self.config.EXTENDED_THINKING_ENABLED:
-                    kwargs["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": self.config.THINKING_BUDGET_TOKENS,
+        # Try in order: adaptive (Claude 4.x), enabled+budget (legacy), no thinking
+        # The first call uses the configured mode; on a thinking-shape API error,
+        # subsequent retries try the alternatives. This makes the orchestrator
+        # robust to Anthropic API surface changes between SDK versions / model
+        # families (the spec was written against the older 'enabled' shape).
+        thinking_modes: list[dict[str, Any] | None] = []
+        if self.config.EXTENDED_THINKING_ENABLED:
+            thinking_modes.extend([
+                {"type": "adaptive"},                                    # current Claude 4.x
+                {"type": "enabled",
+                 "budget_tokens": self.config.THINKING_BUDGET_TOKENS},   # legacy Claude 3.x
+            ])
+        thinking_modes.append(None)                                       # always last fallback
+
+        last_error: Optional[Exception] = None
+        for thinking in thinking_modes:
+            for attempt in range(max_retries):
+                try:
+                    kwargs: dict[str, Any] = {
+                        "model": model,
+                        "max_tokens": self.config.MAX_TOKENS,
+                        "system": _build_system_param(system, self.config),
+                        "messages": messages,
                     }
-                response = await self.client.messages.create(**kwargs)
-                return response, None
-            except APIError as e:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return None, e
-            except Exception as e:
-                return None, e
-        return None, RuntimeError("Exhausted retries without raising")
+                    if thinking is not None:
+                        kwargs["thinking"] = thinking
+                    response = await self.client.messages.create(**kwargs)
+                    return response, None
+                except APIError as e:
+                    last_error = e
+                    msg = str(e).lower()
+                    # If the API rejected the thinking shape, stop retrying this
+                    # mode and move to the next one (don't waste retries on a
+                    # shape we know won't work).
+                    if "thinking" in msg and (
+                        "not supported" in msg or "invalid" in msg
+                        or "unknown" in msg or "deprecated" in msg
+                    ):
+                        break
+                    # Otherwise (rate limit, server error, etc.) retry this mode.
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                except Exception as e:
+                    return None, e
+        return None, last_error or RuntimeError("Exhausted retries without raising")
 
     def _extract_response(self, response: Any) -> tuple[list[str], str]:
         thinking: list[str] = []
@@ -414,11 +440,25 @@ class AgentExecutor:
 
     # ─── Message composition ─────────────────────────────────────────────────
 
-    def _compose_static(self, wiki_content: str, universal: str, scope: str) -> str:
-        parts = [
-            "# UNIVERSAL\n" + universal,
-            "# AGENT WIKI\n" + wiki_content,
-        ]
+    def _compose_static(self, wiki_content: str, universal: str, scope: str,
+                        framework: str = "") -> str:
+        """Static (cacheable) content fed to every agent. Order matters for
+        cache hit consistency — framework first (rarely changes), then UNIVERSAL,
+        then wiki (changes most), then scope (large + project-specific).
+
+        Framework is included so agents see the Project Addendum, the full
+        Framework v4 (artifact-type vocabulary, interaction catalog, D-ARCH log),
+        the Manifesto, and the Orchestrator Spec — not just their role excerpt
+        embedded in the system_prompt. Without this, agents like SG can't see
+        the artifact types they're allowed to produce, the Project Addendum's
+        document manifest, or the Spec §11 OP exchange protocol — which leads
+        to malformed output (e.g., DOC where PROP was needed).
+        """
+        parts = []
+        if framework:
+            parts.append("# FRAMEWORK + PROJECT CONTEXT\n" + framework)
+        parts.append("# UNIVERSAL\n" + universal)
+        parts.append("# AGENT WIKI\n" + wiki_content)
         if scope:
             parts.append("# SCOPE DOCUMENTS\n" + scope)
         return "\n\n".join(parts)
@@ -586,18 +626,31 @@ class AgentExecutor:
         return "\n\n".join(chunks)
 
     def _load_framework(self) -> str:
+        """Load all framework/ files: Framework v4, Manifesto, Spec, CORTEX,
+        and the Project Addendum (whichever VEGA_*_Project_Addendum.md is present).
+
+        Called for every agent execution so they can see artifact-type definitions,
+        interaction catalog, D-ARCH log, and project-specific context. With prompt
+        caching, the first call per agent pays full cost; subsequent calls within
+        the TTL hit the cache.
+        """
         framework_dir = self.config.BASE_DIR / "framework" if hasattr(self.config, "BASE_DIR") else None
         if framework_dir is None or not framework_dir.exists():
             return ""
         chunks = []
+        # Fixed-name framework docs in a stable order (cache-friendly).
         for name in [
             "VEGA_Architecture_Framework_v4.md",
             "VEGA_Manifesto_v4.md",
             "VEGA_Orchestrator_Technical_Spec_v3.md",
+            "VEGA_CORTEX_Addon_Specification_v0.2_BETA.md",
         ]:
             path = framework_dir / name
             if path.exists():
-                chunks.append(path.read_text())
+                chunks.append(f"## {name}\n" + path.read_text())
+        # Project Addendum — match VEGA_*_Project_Addendum.md
+        for path in sorted(framework_dir.glob("VEGA_*_Project_Addendum.md")):
+            chunks.append(f"## {path.name}\n" + path.read_text())
         return "\n\n".join(chunks)
 
     # ─── Logging ─────────────────────────────────────────────────────────────

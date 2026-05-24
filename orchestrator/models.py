@@ -220,10 +220,20 @@ class ConsultationRecord:
 
 def make_gov(reason: str, sender: str = "SYS", priority: str = "P1",
              references: list[str] | None = None) -> Artifact:
-    """Construct an auto-GOV artifact. Used by router on unknown routing keys (Spec §15.3)."""
+    """Construct an auto-GOV artifact. Used by router on unknown routing keys (Spec §15.3).
+
+    Assigns a timestamp-based id since the router doesn't hold a SequenceManager
+    (router is constructed before sequences during orchestrator init). The 'AUTO'
+    prefix marks these as auto-generated; SYS can re-issue with a proper
+    SequenceManager-minted id during its next audit. Without an id, op_backlog.add
+    raises ValueError and the orchestrator crashes when SG produces an unexpected
+    artifact type.
+    """
+    import time
     return Artifact(
         type="GOV",
         sender=sender,
+        id=f"GOV-{sender}-AUTO-{int(time.time() * 1000)}",
         content=f"## Auto-generated governance finding\n\n{reason}\n",
         priority=priority,
         references=references or [],

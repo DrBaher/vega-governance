@@ -160,15 +160,27 @@ class Router:
         await self._append_log(artifact, routed_to=recipients)
 
     async def _route_to_op(self, artifact: Artifact, spec: dict[str, Any]) -> None:
+        """Place in OP backlog; attempt Telegram notify. Notify failures must
+        NOT break routing — the artifact's primary delivery is the op_backlog
+        file (which OP can /backlog to see). Telegram is a notification
+        channel, not the source of truth."""
         if self.op_backlog is not None:
             self.op_backlog.add(artifact)
         if spec.get("notify") and self.telegram_bot is not None:
-            await self.telegram_bot.notify(artifact)
+            try:
+                await self.telegram_bot.notify(artifact)
+            except Exception as e:
+                print(f"[router] Telegram notify failed for {artifact.id}: "
+                      f"{type(e).__name__}: {e}", flush=True)
 
     async def _route_external(self, artifact: Artifact, target: str) -> None:
         """EXT and DE communications. At launch: OP relay (Spec §12.1, §12.2)."""
         if self.telegram_bot is not None:
-            await self.telegram_bot.notify_external_relay(artifact, target)
+            try:
+                await self.telegram_bot.notify_external_relay(artifact, target)
+            except Exception as e:
+                print(f"[router] Telegram relay notify failed for {artifact.id}: "
+                      f"{type(e).__name__}: {e}", flush=True)
 
     async def _handle_unknown(self, artifact: Artifact, key: tuple[str, ...]) -> None:
         """Unknown routing key — auto-create GOV-SYS, route to OP (Spec §4.3 rule 8)."""

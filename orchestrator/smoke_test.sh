@@ -2,29 +2,11 @@
 # Smoke test: scaffold a temp VEGA deployment and verify the structure.
 #
 # Usage: ./smoke_test.sh
-#
-# Honors $PYTHON env var; falls back to `python3` then `python`.
 
 set -euo pipefail
 
-PYTHON="${PYTHON:-}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -z "$PYTHON" ]; then
-  # Prefer a .venv next to the script so deps from requirements.txt are available.
-  if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
-    PYTHON="$SCRIPT_DIR/.venv/bin/python"
-  elif command -v python3 >/dev/null 2>&1; then
-    PYTHON=python3
-  elif command -v python >/dev/null 2>&1; then
-    PYTHON=python
-  else
-    echo "[smoke] ✗ Neither python3 nor python found in PATH. Set PYTHON env var." >&2
-    exit 1
-  fi
-fi
-
 TMPDIR="$(mktemp -d)"
-echo "[smoke] using temp dir: $TMPDIR (python: $PYTHON)"
+echo "[smoke] using temp dir: $TMPDIR"
 
 # Copy this orchestrator into a fake project tree
 PROJECT="$TMPDIR/vega"
@@ -72,7 +54,7 @@ EOF
 cd "$PROJECT/orchestrator"
 
 echo "[smoke] running --init-only…"
-"$PYTHON" main.py --init-only
+python main.py --init-only
 
 echo "[smoke] expected directories:"
 for d in agents universal scope test_models artifacts/archive cycles/active op_backlog/pending state; do
@@ -85,7 +67,7 @@ for d in agents universal scope test_models artifacts/archive cycles/active op_b
 done
 
 echo "[smoke] running pytest…"
-"$PYTHON" -m pytest -x -q || exit 1
+python -m pytest -x -q || exit 1
 
 echo "[smoke] ✓ all checks passed"
 echo "[smoke] cleaning up $TMPDIR"
