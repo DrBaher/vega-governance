@@ -1,5 +1,5 @@
 # V-model Enabled Governance Architecture (VEGA)
-## Architecture Framework v5.0
+## Architecture Framework v6.0
 
 **Author:** Francisco
 **Date:** May 2026
@@ -19,8 +19,9 @@ This document defines a multi-agent governance framework applicable to any proje
 6. Every agent reads its wiki at session start and updates it when something matters.
 7. **Role definitions are stable; wikis evolve.** The role is the fundament — it defines what the agent does, its inputs, outputs, and constraints. The wiki teaches it to do it better over time. Role = constitution. Wiki = case law. The constitution doesn't change every session; the case law grows.
 8. **Agents re-ground in their role periodically.** Every 3 work cycles, agents re-read their role definition and wiki index. Context accumulation causes role drift — the agent responds from recent conversational patterns instead of its actual instructions. Re-grounding is the fix.
-9. **Five-layer authority hierarchy.** Sources (scope documents) > Role definitions > Own wiki > UNIVERSAL wiki > Session context. On contradiction, higher layer wins. Agent follows the higher layer, flags the contradiction, OP resolves.
-10. **No agent blocks on external responses.** OP, Domain Expert, and External Build are all external parties with unpredictable response times. When an agent sends an outbound request (PROP, GOV, DE_OUT, BRP), it logs the pending item and continues all work not dependent on the response. Responses feed into the next cycle, not the current one.
+9. **Five-layer authority hierarchy.** Sources (scope documents) > Role definitions > Own wiki > UNIVERSAL wiki > Session context. On contradiction, higher layer wins. Agent follows the higher layer, flags the contradiction, Admin OP resolves.
+10. **No agent blocks on external responses.** All external roles (OP, Admin OP, DE, EXT) have unpredictable response times. When an agent sends an outbound request (PROP, GOV, DE_OUT, BRP), it logs the pending item and continues all work not dependent on the response. Responses feed into the next cycle, not the current one.
+11. **Role-based external access.** Four roles interact with the system: OP (scope decisions via SG), Admin OP (governance + role management via SYS), DE (domain expertise directly with SG), EXT (build interaction directly with BR). Each role has scoped access — they see and control only their domain. OP has full read visibility across all channels.
 
 **Operational context:** Agents run as Claude chat sessions. Context saturation is the core operational constraint — sessions lose precision as context fills. The wiki system is the structural fix: persistent knowledge that survives session boundaries. The handoff protocol ensures continuity when sessions must be replaced.
 
@@ -40,6 +41,7 @@ This document defines a multi-agent governance framework applicable to any proje
 10. [Decision Log](#10-decision-log)
 11. [Implementation Notes for Claude Code](#11-implementation-notes-for-claude-code)
 12. [Agent Context Views](#12-agent-context-views)
+13. [Role-Based Access System](#13-role-based-access-system)
 
 ---
 
@@ -52,7 +54,7 @@ Every document or message that transits between agents carries a unique identifi
 ```
 
 - **TYPE** = document type code
-- **ISSUER** = agent code (SG, SA, SE, TG, TA, TE, BR, BTA, EXT, OP)
+- **ISSUER** = agent or role code (SG, SA, SE, TG, TA, TE, BR, BTA, SYS, OP, DE, EXT)
 - **SEQ** = three-digit zero-padded sequence (001, 002, ...)
 - **-v[N]** = optional version suffix when revised before acceptance
 
@@ -107,8 +109,9 @@ Every document or message that transits between agents carries a unique identifi
 | PROP | Proposed Disposition | SG | SG's analysis and recommended action — initiates OP-SG working exchange (dialogue, not one-shot) |
 | AUTH | Authorization | OP | OP's final direction after working exchange. Immutable at issuance. |
 | SUM | Exchange Summary | SG | SG's summary of SG↔OP exchange, written after AUTH received. References AUTH-OP-NNN. Immutable. Together AUTH + SUM form the complete auditable record of the dialogue. |
-| GOV | Governance Finding | SYS | Architecture deviation, process violation, missed gate, behavioral drift — reported to OP |
+| GOV | Governance Finding | SYS | Architecture deviation, process violation, missed gate, behavioral drift — reported to Admin OP |
 | REQ | Operator Request | OP | Ad-hoc input from OP to SG. SG triages the content — analyses scope impact, determines if it warrants SCN, REJ, or is informational — and produces PROP if action is needed. |
+| INIT | Initialization | OP | One-time project bootstrap input to SG. Used once at project setup (before normal operation begins). Archived for audit trail. |
 
 **External Expert Communications:**
 
@@ -201,27 +204,40 @@ This is the exhaustive set. If an interaction is not listed here, it does not ex
 | E1 | BR | EXT | BRP-BR-NNN | Distribution or response | Scope, test models (build), answers |
 | E2 | EXT | BR | BRQ-EXT-NNN | Build needs input | Questions, reports, results |
 
-### 2.6 Domain Expert Interface (via Scope Guardian)
+### 2.6 Domain Expert Interface
+
+The Domain Expert interacts directly with SG — no OP relay. DE has their own MCP connection and Telegram, scoped to DE_OUT/DE_IN exchanges only. OP has read visibility into DE↔SG exchanges (configurable push or pull).
 
 | # | From | To | Document | Trigger | Content |
 |---|------|----|----------|---------|---------|
 | H1 | SG | DE | DE_OUT-SG-NNN | Expert review needed | Review requests, clarification questions, data for validation |
 | H2 | DE | SG | DE_IN-DE-NNN | Expert responds | Review results, clarifications, confirmations |
 
-Note: Domain Expert never communicates with Build directly. Data flows: Domain Expert → SG (assessment) → OP (validation) → BR → EXT. See §4 for full protocol.
+Note: Domain Expert never communicates with Build directly. Data flows: Domain Expert → SG (assessment) → OP (validation) → BR → EXT. DE has direct access to SG but no visibility into the build layer. See §4 for full protocol.
 
 ### 2.7 System Auditor
 
 | # | From | To | Document | Trigger | Content |
 |---|------|----|----------|---------|---------|
-| G1 | SYS | OP | GOV-SYS-NNN | Governance violation detected | Process violation, skipped gate, unauthorized communication — goes to OP backlog (non-blocking, SYS continues) |
-| G2 | OP | SYS | (manual) | OP requests audit or responds during GOV cycle | OP-initiated governance review, or multi-turn exchange within GOV cycle (same mechanism as PROP exchange) |
+| G1 | SYS | Admin OP | GOV-SYS-NNN | Governance violation detected | Process violation, skipped gate, unauthorized communication — goes to admin_backlog (non-blocking, SYS continues) |
+| G2 | Admin OP | SYS | (manual) | Admin OP requests audit or responds during GOV cycle | Admin OP-initiated governance review, or multi-turn exchange within GOV cycle (same mechanism as PROP exchange) |
 
-Note: SYS has read access to all agent artifacts and wikis. SYS has **write access to UNIVERSAL** for cross-agent knowledge propagation (autonomous). SYS only escalates to OP for governance violations (GOV). GOV items go to OP backlog — **SYS does not block on OP response.** SYS continues scheduled audits, UNIVERSAL updates, and can produce additional GOV items while prior ones are pending.
+Note: SYS has read access to all agent artifacts and wikis. SYS has **write access to UNIVERSAL** for cross-agent knowledge propagation (autonomous). SYS only escalates to Admin OP for governance violations (GOV). GOV items go to Admin OP backlog — **SYS does not block on Admin OP response.** SYS continues scheduled audits, UNIVERSAL updates, and can produce additional GOV items while prior ones are pending.
 
-### 2.8 SG↔OP Priority Levels
+Admin OP also manages role assignments (OP, DE, EXT) directly via the orchestrator's role management tools, with 2FA confirmation (see §13). SYS audits role events but is not in the role management flow.
 
-OP has two ongoing decision channels: **SG** (all scope decisions, via PROP → exchange → AUTH) and **SYS** (governance violations, via GOV → exchange → resolution). Both support multi-turn dialogue. Both are non-blocking — agents continue other work while OP items are pending. All other agents receive OP direction through their guardian or through propagation. Initialization is one-time.
+### 2.8 Roles and Channels
+
+Four roles interact with the system, each scoped to their domain:
+
+| Role | Interacts with | Scope | Visibility |
+|------|---------------|-------|-----------|
+| **OP** (Operator) | SG via PROP/AUTH exchange | All scope decisions, /request | Read visibility into DE and EXT channels (configurable push/pull) |
+| **Admin OP** | SYS via GOV exchange | Governance audit, role management, agent config | Full system visibility |
+| **DE** (Domain Expert) | SG directly | Respond to DE_OUT, initiate domain observations | Own DE↔SG thread only |
+| **EXT** (External Build) | BR directly | Respond to BRP, submit results/questions | Own BR↔EXT thread only |
+
+OP and Admin OP can be the same person (separable). Each role authenticates via scoped MCP token + Telegram ID.
 
 The SG↔OP working exchange is the primary channel where human response time constrains the system. Priority levels signal urgency:
 
@@ -293,9 +309,9 @@ When changing any field's name, type, or semantics: grep EVERY document for EVER
 
 ## 4. Domain Expert Interaction Protocol
 
-The Domain Expert is the external domain expert. Their input is authoritative on domain reasoning but must be verified against the project's data integrity rules. Interactions follow a formal protocol.
+The Domain Expert interacts directly with SG through their own MCP connection and Telegram — no OP relay. Their input is authoritative on domain reasoning but must be verified against the project's data integrity rules. Interactions follow a formal protocol. OP has read visibility into DE↔SG exchanges.
 
-**Current Domain Expert:** [Assigned at project start].
+**Current Domain Expert:** [Assigned at project start via Admin OP role management].
 
 ### 4.1 Naming Convention
 
@@ -303,7 +319,7 @@ The Domain Expert is the external domain expert. Their input is authoritative on
 DE_[NNN]_[YYYYMMDD]_[DIR]_[descriptor].md
 ```
 
-Where DIR = OUT (sent to Domain Expert) | IN (received from Domain Expert) | SG (Scope Guardian assessment of response). NNN is a global sequential number across all Domain Expert communications.
+Where DIR = OUT (sent to Domain Expert) | IN (received from Domain Expert). NNN is a global sequential number across all Domain Expert communications.
 
 ### 4.2 Interaction Rules
 
@@ -349,6 +365,7 @@ Analytical and recommendation role for scope integrity. Receives issues and devi
 | BR | DEV-BR-NNN | Deviation notices from build interaction |
 | TG | ESC-TG-NNN | Scope-level defects from test failure triage |
 | OP | REQ-OP-NNN | Operator request — ad-hoc scope work, change request, question |
+| OP | INIT-OP-001 | One-time project bootstrap (initialization only) |
 | OP | AUTH-OP-NNN | Authorization / modification / override of SG proposed disposition |
 | DE | DE_IN | Domain Expert response to outstanding question |
 
@@ -832,7 +849,7 @@ PATTERN ALERTS:
 
 #### Purpose
 
-Governance quality assurance and cross-agent knowledge propagation. Has read access to all agent artifacts, wikis, and log.md files (artifact archaeologist — SYS reads what agents produce, not live transcripts). Has write access to UNIVERSAL wiki for cross-agent knowledge propagation (autonomous). Flags governance violations to OP. This is the governance system's own V-model.
+Governance quality assurance and cross-agent knowledge propagation. Has read access to all agent artifacts, wikis, and log.md files (artifact archaeologist — SYS reads what agents produce, not live transcripts). Has write access to UNIVERSAL wiki for cross-agent knowledge propagation (autonomous). Flags governance violations to Admin OP. This is the governance system's own V-model.
 
 #### Preamble
 
@@ -843,14 +860,14 @@ Governance quality assurance and cross-agent knowledge propagation. Has read acc
 | Source | Document type | Content |
 |--------|---------------|---------|
 | All agents | (read-only) | All artifacts on disk: FND, SCN, DOC, VAL, REV, NOTE, AUTH (with exchange summaries), TFR, VR, wiki files, log.md entries |
-| OP | (manual) | Audit requests (OP-initiated only) |
+| Admin OP | (manual) | Audit requests (Admin OP-initiated only) |
 
 #### Outputs
 
 | Destination | Document type | Content |
 |-------------|---------------|---------|
-| OP | GOV-SYS-NNN | Governance violation: process violation, skipped gate, unauthorized communication — requires OP awareness |
-| UNIVERSAL | (direct write) | Cross-agent knowledge propagation: updated cross_agent_rules.md, concept_graph.md, new universal pages. Autonomous — no OP approval needed. |
+| Admin OP | GOV-SYS-NNN | Governance violation: process violation, skipped gate, unauthorized communication — requires Admin OP awareness |
+| UNIVERSAL | (direct write) | Cross-agent knowledge propagation: updated cross_agent_rules.md, concept_graph.md, new universal pages. Autonomous — no approval needed. |
 
 #### Core Responsibilities
 
@@ -858,21 +875,22 @@ Governance quality assurance and cross-agent knowledge propagation. Has read acc
 2. **Gate effectiveness audit.** Are findings being raised that should be? Are rejections correct? If a deviation was caught late that could have been caught early, that's a governance gap.
 3. **Cross-agent knowledge propagation.** When one agent discovers a pattern relevant to others, SYS writes it to UNIVERSAL autonomously. Example: BR discovers build always misclassifies overloaded terms → SYS adds this to UNIVERSAL/cross_agent_rules.md so all agents benefit.
 4. **Wiki health monitoring.** Are agents reading their wikis (check log.md for session-start reads)? Are they updating after corrections? Is knowledge accumulating or stagnating?
-5. **Audit on OP request.** When OP requests a specific governance review, perform targeted analysis and report findings.
+5. **Audit on Admin OP request.** When Admin OP requests a specific governance review, perform targeted analysis and report findings.
+6. **Role event audit.** Read role_events.jsonl and flag suspicious patterns: off-hours role changes, rapid assignment/revocation cycles, privilege escalation. See §13 for the role management audit trail.
 
 #### Behavioral Rules
 
 1. **Artifact archaeologist, not omniscient.** SYS reads what's on disk. If an exchange isn't captured in an artifact or log, SYS can't see it. This makes log.md honesty and AUTH exchange summaries critical dependencies.
-2. **Flag governance violations to OP.** Process violations, skipped gates, unauthorized communications → GOV-SYS-NNN to OP. OP decides the response.
-3. **Write UNIVERSAL autonomously with exclusion check.** Before writing any rule to UNIVERSAL, verify it is consistent with all role definitions. If the rule contradicts an agent's role or wiki: write it to UNIVERSAL with an exclusion tag naming the conflicting agent and the specific contradiction. Flag GOV-SYS-NNN to OP. The excluded agent skips the rule until OP resolves. After OP resolves, SYS removes the exclusion and adds an agent-addressed correction to UNIVERSAL. The agent self-corrects at next session start. SYS verifies via log.md, then removes the correction.
+2. **Flag governance violations to Admin OP.** Process violations, skipped gates, unauthorized communications → GOV-SYS-NNN to Admin OP. Admin OP decides the response.
+3. **Write UNIVERSAL autonomously with exclusion check.** Before writing any rule to UNIVERSAL, verify it is consistent with all role definitions. If the rule contradicts an agent's role or wiki: write it to UNIVERSAL with an exclusion tag naming the conflicting agent and the specific contradiction. Flag GOV-SYS-NNN to Admin OP. The excluded agent skips the rule until Admin OP resolves. After Admin OP resolves, SYS removes the exclusion and adds an agent-addressed correction to UNIVERSAL. The agent self-corrects at next session start. SYS verifies via log.md, then removes the correction.
 4. **Don't duplicate auditor roles.** SYS does not re-audit scope quality (SA), test model quality (TA), or build conformance (BTA). SYS audits the governance process itself.
 5. **Never modify agent-local wikis.** SYS writes to UNIVERSAL only. Agent-specific wikis are owned by the agent.
 
 #### Constraints
 
-- Read access to all agent artifacts and wikis. Write access to UNIVERSAL only.
-- GOV-SYS-NNN to OP for governance violations. No other OP-directed outputs.
-- OP contacts SYS for audit requests. SYS does not initiate OP contact except for governance violations.
+- Read access to all agent artifacts, wikis, execution_log.json, and role_events.jsonl. Write access to UNIVERSAL only.
+- GOV-SYS-NNN to Admin OP for governance violations. No other Admin OP-directed outputs.
+- Admin OP contacts SYS for audit requests. SYS does not initiate Admin OP contact except for governance violations.
 
 ---
 
@@ -900,7 +918,7 @@ Each agent's wiki follows this structure:
 3. **Update when something matters.** Not every conversation changes the wiki. When a new pattern emerges, a rule is learned, or a significant decision is made — update.
 4. **Short entries, dense content.** No verbosity.
 5. **Never delete history.** Correct, supersede, or archive — but don't erase.
-6. **Role wins over wiki on direct contradiction.** The wiki refines, adds nuance, adds cases — but it cannot contradict the role definition. If the wiki says "do Y" and the role says "do not-Y," the agent follows the role, flags the contradiction in log.md, and reports it as a self-lint finding. Resolution path: OP either updates the role (if the wiki learned something the role should incorporate) or corrects the wiki (if the wiki drifted wrong). The agent does NOT resolve the contradiction itself. Wiki entries should never be phrased as overrides ("instead of what the role says, do X") — only as refinements ("when the role says verify, here's how to verify effectively").
+6. **Role wins over wiki on direct contradiction.** The wiki refines, adds nuance, adds cases — but it cannot contradict the role definition. If the wiki says "do Y" and the role says "do not-Y," the agent follows the role, flags the contradiction in log.md, and reports it as a self-lint finding. Resolution path: Admin OP either updates the role (if the wiki learned something the role should incorporate) or corrects the wiki (if the wiki drifted wrong). The agent does NOT resolve the contradiction itself. Wiki entries should never be phrased as overrides ("instead of what the role says, do X") — only as refinements ("when the role says verify, here's how to verify effectively").
 
 ### Wiki Update Protocol
 
@@ -997,7 +1015,7 @@ These make the loop's learning mechanism explicit:
 
 ## 7. Test Model Format Specification
 
-> **Note:** The format below is an informational template. At project initialization, Tests Guardian defines and documents the project-specific test decomposition structure (levels, ID format, input fields) as one of its first responsibilities. This structure must be validated by OP before test model development begins, and maintained as the project evolves.
+> **Note:** The format below is an informational template. At project initialization, Tests Guardian defines and documents the project-specific test decomposition structure (levels, ID format, input fields) as one of its first responsibilities. This structure must be validated through TA review (per TG Core Responsibility 1) before test model development begins, and maintained as the project evolves.
 
 ### 7.1 Decomposition Structure (defined per project)
 
@@ -1218,14 +1236,14 @@ Analogous to SCN but for test models:
 | D-ARCH-008 | Domain Expert interaction protocol formalized | Domain Expert is a formal external interface with naming convention, cross-check rules, and routing through SG. Not ad-hoc. |
 | D-ARCH-009 | Context compression warning | Compression produces confabulation. After any compression or session restart, agents must re-read source files before citing summaries. |
 | D-ARCH-010 | Role-prefixed decision numbering | D-[NNN] for scope (SG), TD-[NNN] for test (TG), GD-[NNN] for governance (SYS). No shared namespace, no coordination needed. Replaces previous "OP coordinates" non-design. |
-| D-ARCH-011 | OP = Francisco | Francisco is the operator/orchestrator managing the agent system. |
+| D-ARCH-011 | OP + Admin OP = Francisco | Francisco holds both OP (scope operator) and Admin OP (governance + role management). Roles are separable — can be assigned to different people. |
 | D-ARCH-012 | SG requires OP validation via working exchange | SG analyses and recommends; OP and SG engage in dialogue until OP directs. PROP/AUTH are formal bookends. AUTH includes mandatory exchange summary written by SG. Post-application validation (VAL/REV) does not require OP sign-off. |
 | D-ARCH-013 | Agent instance IDs with session reference | Format: [ROLE]-S[NNN]. Artifacts carry the instance ID that produced them. |
 | D-ARCH-014 | Wiki management protocol formalized | Explicit triggers for read (7), update (7), lint (5), what not to update (3), how to update (5), failure-type update instructions. log.md tracks reasoning, not just outcomes. |
-| D-ARCH-015 | System Auditor (SYS) as 9th agent | Artifact archaeologist (reads artifacts, not live transcripts). Read access to all agents. Write access to UNIVERSAL (autonomous knowledge propagation). GOV to OP for governance violations only. OP-initiated audit requests. |
+| D-ARCH-015 | System Auditor (SYS) as 9th agent | Artifact archaeologist (reads artifacts, not live transcripts). Read access to all agents. Write access to UNIVERSAL (autonomous knowledge propagation). GOV to Admin OP for governance violations only. Admin OP-initiated audit requests. |
 | D-ARCH-016 | TA mandate expanded | "Audits test quality AND finds the system's blind spots." Coverage gaps in the test model are the system's blind spots. |
-| D-ARCH-017 | Role stability + role-over-wiki authority | Role = constitution. Wiki = case law. Wiki refines but cannot contradict role. On direct contradiction: agent follows role, flags contradiction, OP resolves. |
-| D-ARCH-018 | Priority levels for SG↔OP exchange | P0-P3. OP has two ongoing channels: SG (scope decisions) and SYS (governance violations). All others through propagation. Initialization is one-time. |
+| D-ARCH-017 | Role stability + role-over-wiki authority | Role = constitution. Wiki = case law. Wiki refines but cannot contradict role. On direct contradiction: agent follows role, flags contradiction, Admin OP resolves. |
+| D-ARCH-018 | Priority levels for SG↔OP exchange | P0-P3. Four roles interact with the system: OP (scope via SG), Admin OP (governance via SYS), DE (directly with SG), EXT (directly with BR). See §2.8. |
 | D-ARCH-019 | Periodic re-grounding | Every 3 work cycles OR at ~40% context usage, whichever first. Both triggers in protocol table. |
 | D-ARCH-020 | Three-layer architecture (Sources → Wiki → Schema) | Strict hierarchy: sources (immutable) > wiki (compiled knowledge) > session context. |
 | D-ARCH-021 | log.md with reasoning capture | Append-only chronological log. Must capture reasoning, not just outcomes. Mandatory for SYS audit and AUTH exchange summary completeness. |
@@ -1233,16 +1251,21 @@ Analogous to SCN but for test models:
 | D-ARCH-023 | Two-certificate test model validation | Full version validated first (first certificate). Build version generated by strip script from validated full version, then validated against full (second certificate). Propagation only after both certificates. |
 | D-ARCH-024 | NOTE document type | General-purpose editor note: blocking or observation, standalone or with DOC. Replaces DOC overloading for inability-to-apply and other editor communications. |
 | D-ARCH-025 | AUTH cycle produces two immutable artifacts | AUTH-OP-NNN (OP's direction, immutable at issuance) and SUM-SG-NNN (SG's exchange summary, written after AUTH, immutable). Together they form the complete auditable record. Neither is amended after creation. |
-| D-ARCH-026 | OP channels: SG + SYS only | OP's ongoing channels: SG (all scope decisions via PROP→AUTH) and SYS (governance violations via GOV, OP-initiated audits). All other agents receive OP direction through propagation. Initialization is one-time bootstrap. |
+| D-ARCH-026 | Four roles with scoped access | Four external roles: OP (scope via SG), Admin OP (governance via SYS + role management), DE (domain expertise directly with SG), EXT (build directly with BR). Each role has scoped MCP tools + Telegram. OP has full read visibility. Admin OP has full system visibility. OP and Admin OP are separable (same person can hold both). |
 | D-ARCH-027 | Build version is script-generated | Strip script derives build version from validated full version. TE runs the script, does not manually edit build version. Eliminates drift from manual derivation. |
 | D-ARCH-028 | Strip script is TE's internal tool | TE owns the strip mechanism. TG validates the outcome independently without knowing or prescribing the method — same actor-critic pattern as SG/SE. TA can audit TE's methods including the script. |
 | D-ARCH-029 | TA receives PRO-SCOPE for independent audit | TA derives its own view of what needs testing from scope (top-down + bottom-up), then compares against TG's test model. TA audits the scope, not TG's decomposition. This breaks the chicken-and-egg: TA's framework is the scope, not TG's structure. |
-| D-ARCH-030 | Authority hierarchy: Sources > Role > Own wiki > UNIVERSAL > Session | Strict hierarchy. On contradiction, higher layer wins. Agent follows higher layer, flags contradiction, OP resolves. |
-| D-ARCH-031 | SYS UNIVERSAL writes with exclusion mechanism | SYS writes to UNIVERSAL autonomously. If new rule contradicts an agent's role/wiki: publish with exclusion tag + GOV to OP. After OP resolves: SYS removes exclusion, adds agent-addressed correction. Agent self-corrects at next session. SYS verifies via log.md. Exclusion metadata format is strict (SYS must follow exactly): heading, then `excluded_for: [AGENT_CODE, ...]`, then `gov_reference: GOV-SYS-NNN`, then `---` separator, then content. This order is required — the orchestrator's exclusion filter depends on this structure. |
-| D-ARCH-032 | No agent blocks on external responses | OP, Domain Expert, and External Build are external parties. When an agent sends an outbound request (PROP, GOV, DE_OUT, BRP), it logs the pending item and continues all work not dependent on the response. Responses feed into the next cycle. |
-| D-ARCH-033 | REQ artifact type for OP→SG | Ad-hoc operator input to SG. Triaged identically to FND/DEV/ESC. OP is not a privileged input source — SG may recommend rejecting OP's own request. |
-| D-ARCH-034 | SYS↔OP dialogue via GOV cycle | SYS produces GOV → goes to OP backlog (non-blocking). OP can engage in multi-turn exchange with SYS (same mechanism as PROP cycle). Closes on /resolve. SYS continues other work while GOV is pending. |
+| D-ARCH-030 | Authority hierarchy: Sources > Role > Own wiki > UNIVERSAL > Session | Strict hierarchy. On contradiction, higher layer wins. Agent follows higher layer, flags contradiction, Admin OP resolves. |
+| D-ARCH-031 | SYS UNIVERSAL writes with exclusion mechanism | SYS writes to UNIVERSAL autonomously. If new rule contradicts an agent's role/wiki: publish with exclusion tag + GOV to Admin OP. After Admin OP resolves: SYS removes exclusion, adds agent-addressed correction. Agent self-corrects at next session. SYS verifies via log.md. Exclusion metadata format is strict (SYS must follow exactly): heading, then `excluded_for: [AGENT_CODE, ...]`, then `gov_reference: GOV-SYS-NNN`, then `---` separator, then content. This order is required — the orchestrator's exclusion filter depends on this structure. |
+| D-ARCH-032 | No agent blocks on external responses | All external roles (OP, Admin OP, DE, EXT) have unpredictable response times. When an agent sends an outbound request (PROP, GOV, DE_OUT, BRP), it logs the pending item and continues all work not dependent on the response. Responses feed into the next cycle. |
+| D-ARCH-033 | REQ artifact type for OP→SG | Ad-hoc operator input to SG. Triaged identically to FND/DEV/ESC. Produces PROP through the normal PROP→AUTH exchange. |
+| D-ARCH-034 | SYS↔Admin OP dialogue via GOV cycle | SYS produces GOV → goes to Admin OP backlog (non-blocking). Admin OP can engage in multi-turn exchange with SYS (same mechanism as PROP cycle). Closes on /resolve. SYS continues other work while GOV is pending. |
 | D-ARCH-035 | DE non-blocking with pending tracking | SG logs DE_OUT in pending_external.md (what was asked, what depends on it). Continues all work not dependent on the answer. DE_IN feeds into next analysis cycle. |
+| D-ARCH-036 | Token-scoped MCP access | Each role gets a scoped MCP token. The token determines which tools are visible — OP sees scope tools, DE sees DE tools, EXT sees EXT tools, Admin OP sees governance + role tools. One MCP endpoint, tools filtered by identity. Unauthenticated connections see only vega_request_access(). |
+| D-ARCH-037 | 2FA for role management | Role assignment, modification, and removal require two-factor confirmation. Orchestrator sends OTP to Admin OP's Telegram. Confirmation via Telegram (direct APPROVE) or MCP (OTP code). Prevents MCP mediation errors and token compromise from modifying access control. |
+| D-ARCH-038 | Direct DE access (no OP relay) | DE interacts with SG directly through their own MCP + Telegram. No OP mediation on DE↔SG exchanges. OP has configurable read visibility (push or pull). Scope changes from DE input still require OP approval via PROP→AUTH. |
+| D-ARCH-039 | Direct EXT access (no OP relay) | EXT interacts with BR directly through their own MCP + Telegram. No OP mediation on EXT↔BR exchanges. OP has configurable read visibility. Scope changes from build findings still flow through BR→SG→OP. |
+| D-ARCH-040 | Invite-activate-2FA role onboarding | New roles are onboarded via: Admin OP approves request → orchestrator sends invite code to assignee's Telegram → assignee activates via MCP with invite code + 2FA → permanent token returned only in MCP session (never in Telegram). |
 
 ---
 
@@ -1250,7 +1273,7 @@ Analogous to SCN but for test models:
 
 ### Context Saturation — The Core Problem
 
-Each agent runs as a Claude session. Sessions lose precision as context fills. Symptoms: compression artifacts, dropped cross-references, pattern-matched responses instead of verified claims.
+Each agent executes as a stateless API call (see Orchestrator §18 Session Semantics). Within conversation cycles, context accumulates across turns. Symptoms of context pressure: compression artifacts, dropped cross-references, pattern-matched responses instead of verified claims.
 
 **Structural fixes:**
 1. **Wiki system.** Each agent reads wiki at session start, updates when things matter. Knowledge persists across session boundaries.
@@ -1318,6 +1341,8 @@ Each agent is a separate Claude instance with:
 ```
 
 ### Session Handoff Protocol
+
+> **Note:** In the stateless orchestrator model, session handoff is not needed. Each agent execution starts fresh with full wiki + role + UNIVERSAL. The wiki IS the handoff — compiled knowledge persists across executions and instance rotations. Conversation cycles carry context within bounded interactions. This protocol is retained as reference for non-orchestrator deployments (e.g., manual Claude sessions).
 
 When a session approaches saturation or must be replaced:
 
@@ -1401,14 +1426,14 @@ VEGA is a 9-agent governance system organized in two V-model lanes (scope and te
 
 **Key principles:**
 - Generators don't evaluate their own output; evaluators don't generate what they evaluate
-- One human decision channel: OP decides through SG (via PROP → exchange → AUTH)
-- SYS reports governance violations to OP (via GOV → exchange → /resolve)
+- One human decision channel for scope: OP decides through SG (via PROP → exchange → AUTH)
+- SYS reports governance violations to Admin OP (via GOV → exchange → /resolve)
 - Five-layer authority: Sources > Role definitions > Own wiki > UNIVERSAL > Session
 - No agent blocks on external responses (D-ARCH-032)
 - Every artifact routes through the routing table — the interaction catalog is the single source of truth
 - Archive is immutable — never modified after write
 
-**Division of authority:** OP governs the framework. SG governs scope documents. SYS audits governance compliance.
+**Division of authority:** OP governs scope (via SG). Admin OP governs the system (via SYS + role management). SG executes scope changes. SYS audits governance compliance.
 
 ### 12.2 Guardian Framework View (loaded for: SG, TG — ~12k tokens)
 
@@ -1441,3 +1466,121 @@ System prompt only — no additional framework context:
 - §2 own interaction rows only (embedded in system prompt)
 
 SE and TE execute precisely. Extra architectural context risks over-reasoning about governance instead of applying changes.
+
+---
+
+## 13. Role-Based Access System
+
+### 13.1 Roles
+
+Four external roles interact with the VEGA system:
+
+| Role | Agent channel | Scope of authority | Visibility |
+|------|--------------|-------------------|-----------|
+| **OP** | SG | Scope decisions: /request, /approve, /reject, /modify, /exchange | Read visibility into DE and EXT channels (configurable push/pull) |
+| **Admin OP** | SYS | Governance: /sys, /resolve. Role management: /role. Agent config: /model, /rotate, /pause, /resume | Full system visibility |
+| **DE** | SG (direct) | Domain expertise: respond to DE_OUT, initiate domain observations | Own DE↔SG exchanges only |
+| **EXT** | BR (direct) | Build interaction: respond to BRP, submit results/questions | Own BR↔EXT exchanges only |
+
+OP and Admin OP are separable roles. The same person can hold both (two tokens, two MCP connections). When different people hold them, scope authority and system authority are cleanly separated.
+
+### 13.2 Authentication
+
+Each role authenticates via:
+- **MCP token:** Scoped — determines which tools are visible. One MCP endpoint, tools filtered by identity.
+- **Telegram ID:** For push notifications and 2FA confirmation.
+
+Unauthenticated MCP connections see only `vega_request_access()` — the lobby.
+
+Tokens are stored hashed (never in plain text). The orchestrator verifies tokens on each request by comparing hashes. A compromised token can be revoked by Admin OP without affecting other roles.
+
+### 13.3 Role Onboarding (Invite-Activate-2FA)
+
+1. **Request:** Person submits via unauthenticated MCP lobby (`vega_request_access(name, telegram_id, role, project)`) or Admin OP submits via MCP.
+2. **Approve:** Admin OP receives request on Telegram. Approves via Telegram (reply APPROVE) or MCP (OTP code). 2FA required.
+3. **Invite:** Orchestrator generates temporary invite code, sends to person's Telegram: "Your invite code: VEGA-DE-7K3M9X. Configure MCP with this code and say 'activate my VEGA role.' Expires in 24 hours."
+4. **Activate:** Person connects MCP with invite code, calls `vega_activate_role()`. Orchestrator sends 2FA to person's Telegram. Person confirms with code.
+5. **Token delivery:** Permanent token returned ONLY in the MCP response (never visible in Telegram). Invite code invalidated.
+
+### 13.4 2FA for Role Management
+
+Role assignment, modification, and removal require two-factor confirmation:
+
+```
+Admin OP action via MCP or Telegram
+→ Orchestrator generates OTP, sends to Admin OP's Telegram
+→ Admin OP confirms:
+    - On Telegram: reply APPROVE (direct, no code needed)
+    - On MCP: enter OTP code (proves they saw the Telegram)
+→ Action executed
+
+OTP expires after 5 minutes. Expired or incorrect codes are 
+logged as security events visible to Admin OP.
+```
+
+This prevents: (a) MCP mediation errors (Claude misinterpreting discussion as directive), (b) compromised MCP token from modifying access control, (c) accidental role changes during scoping discussions.
+
+### 13.5 Notification Configuration
+
+Each role's notifications are configurable independently by Admin OP:
+
+```python
+ROLE_NOTIFICATIONS = {
+    "OP": {
+        "own_channel": "push",      # PROP/AUTH → always push
+        "de_channel": "pull",        # DE↔SG → query on demand
+        "ext_channel": "pull",       # EXT↔BR → query on demand
+    },
+    "ADMIN_OP": {
+        "gov_channel": "push",       # GOV → always push
+        "all_channels": "pull",      # Everything else → query
+    },
+    "DE": {
+        "own_channel": "push",       # DE_OUT → always push
+    },
+    "EXT": {
+        "own_channel": "push",       # BRP → always push
+    },
+}
+```
+
+A shared Telegram group can receive notification-only broadcasts (all roles see system activity). Individual Telegram conversations remain role-specific.
+
+### 13.6 Break-Glass Recovery
+
+A recovery key is generated at deployment and displayed once:
+
+```
+🔑 VEGA Recovery Key (store offline, never in digital systems):
+   VEGA-RECOVERY-8K4M2X9P7W3N
+   
+   This key resets Admin OP credentials via server CLI.
+   It cannot be retrieved after this message.
+```
+
+The key is stored hashed in `config/recovery.hash`. The plain text is never stored by the system.
+
+To use (on the server, not via MCP):
+
+```bash
+vega recover --key VEGA-RECOVERY-8K4M2X9P7W3N --new-admin-telegram 12345
+```
+
+This:
+1. Verifies the key against the stored hash
+2. Revokes all existing Admin OP tokens
+3. Generates a new Admin OP invite sent to the provided Telegram ID
+4. Logs the recovery event in role_events.jsonl
+5. Triggers an immediate SYS audit
+
+The recovery key bypasses MCP entirely — it's a server-side CLI operation. If MCP is compromised, the attacker cannot use the recovery key (no MCP tool exposes it). If Admin OP loses access, the recovery key restores it without needing any existing credentials.
+
+Recovery key rotation: Admin OP can generate a new recovery key via `vega rotate-recovery-key` on the server CLI. The old key is invalidated.
+
+### 13.7 Telegram ID Verification
+
+The orchestrator confirms a Telegram ID is reachable (test message during activation). The identity behind the ID (this account belongs to this person) is verified by Admin OP through out-of-band means. This is acceptable for project teams where Admin OP knows participants.
+
+### 13.8 Scope Governance Unchanged
+
+Direct DE and EXT access does not bypass scope governance. DE telling SG "this classification is wrong" triggers SG to produce PROP-SG-NNN → OP validates via AUTH. EXT findings flow through BR→SG→OP. The PROP→AUTH cycle is the gate — who initiates the input doesn't change who approves the output.

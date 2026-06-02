@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.3.0 — June 2026
+
+### Architecture Framework v6
+
+**Multi-role access system (D-ARCH-036 through D-ARCH-040):**
+- **Four external roles:** OP (scope via SG), Admin OP (governance via SYS + role management), DE (domain expertise directly with SG), EXT (build interaction directly with BR). Each role has scoped MCP token + Telegram.
+- **No OP relay:** DE and EXT interact directly with their agents. OP has configurable read visibility into DE and EXT channels. Scope governance unchanged — all scope changes still flow through PROP→AUTH.
+- **OP and Admin OP separable (D-ARCH-026 rewritten):** Same person can hold both. When separated, scope authority and system authority are cleanly divided.
+- **Token-scoped MCP access (D-ARCH-036):** One endpoint, tools filtered by token identity. Unauthenticated lobby for role requests.
+- **2FA for role management (D-ARCH-037):** OTP sent to Admin OP's Telegram. Confirm via Telegram (APPROVE) or MCP (OTP code).
+- **Invite-activate-2FA onboarding (D-ARCH-040):** Admin OP approves → invite code to assignee's Telegram → activate via MCP with OTP → permanent token returned only in MCP.
+- **New §13 Role-Based Access System:** Roles, authentication, onboarding, 2FA, notification configuration, break-glass recovery, Telegram ID verification, scope governance invariant.
+- **Break-glass recovery (§13.6):** Recovery key generated at deployment, stored hashed, server CLI only. Revokes Admin OP, generates new invite, triggers SYS audit.
+- **SYS gains role event audit (§5.9 responsibility 6):** Reads role_events.jsonl. Flags suspicious patterns.
+- **GOV→Admin OP:** All SYS governance outputs go to Admin OP, not OP. Separate admin_backlog queue.
+- **INIT type formalized:** Added to §1 type catalog and SG inputs table.
+- **ISSUER list updated:** Now includes SYS and DE.
+- **Session Handoff Protocol:** Marked as legacy (stateless model eliminates handoff).
+
+### Orchestrator Spec v5
+
+**Multi-role implementation:**
+- **RoleManager class (§10.4):** Token hashing/verification, OTP generation, invite/activation lifecycle, revocation, modification, break-glass recovery, role_events.jsonl audit trail with documented schema.
+- **MCPServer class (§12.3):** aiohttp HTTP endpoint, bearer token authentication, _PENDING pseudo-role for activation, role-filtered tool dispatch, 21+ tools across 5 role tiers.
+- **Role-dispatching Telegram handlers (§10.2):** handle_message dispatches by chat_id → role. Full handlers for OP, Admin OP, DE, EXT with all commands specified.
+- **Dual backlogs (§10.1):** op_backlog (PROP for OP) + admin_backlog (GOV for Admin OP). Generic Backlog class. Resolve handles items from pending or in_progress.
+- **GOV routes to ADMIN_OP:** Routing table, ADMIN_BOUND_TYPES, execute_sys, auto-GOV all target admin_backlog.
+- **CycleManager complete:** 8 new methods defined (close_by_artifact, get_active_by_artifact, get_cycle_by_participants, get_active_by_type, get_activity_summary, get_pending_for_role, get_history_for_role, check_context_usage).
+- **apply_universal_update:** Now handles replace_section with diff logging.
+- **read_universal(agent_code):** Exclusion filtering per D-ARCH-031 at every call site.
+- **config/ directory:** roles.json, recovery.hash, notifications.json, invites/.
+- **state/role_events.jsonl:** Append-only audit trail with 9-field schema.
+- **Concurrency table:** 5 new state files with protection.
+- **32-item launch checklist:** Infrastructure, directory, role bootstrap, functional tests, production.
+- **Framework filename:** Updated to v6 throughout.
+
+### CORTEX Addon v0.2 BETA
+- Framework reference updated to v6.0
+- No architectural changes
+
 ## v0.2.0 — May 2026
 
 ### Architecture Framework v5

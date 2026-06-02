@@ -2,6 +2,8 @@
 
 Persistent knowledge stores for each agent, extracted from 5 sessions spanning March–May 2026.
 
+> **⚠️ These seeds carry LOINC-project-specific knowledge.** They were extracted from the LOINC Resolver project and contain domain-specific facts (document names, LOINC terminology, project-specific patterns). For a new project: strip project-specific facts before deployment, or use these as a reference for what mature wikis look like rather than deploying as-is. Use `examples/project_addendum_template.md` to carry project-specific knowledge instead.
+
 ## Reliability
 
 | Source | Agents covered | Reliability |
@@ -10,7 +12,7 @@ Persistent knowledge stores for each agent, extracted from 5 sessions spanning M
 | Scope Editor extraction | SE | HIGH — dedicated role session, most recent |
 | Session 1 extraction | BR, TG, BTA (curated) | MEDIUM — multi-role session, filtered by role |
 | Session 3 extraction | SA (audit methodology) | MEDIUM — pre-architecture, audit-focused rules |
-| Session 2 extraction | (folded into universal) | LOW — oldest, pre-role-split |
+| Session 2 extraction | (patterns survived into UNIVERSAL rules; original session wiki discarded) | LOW — oldest, pre-role-split |
 
 ## Structure
 

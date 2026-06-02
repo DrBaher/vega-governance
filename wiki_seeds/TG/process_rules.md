@@ -53,8 +53,8 @@ When PRO-SCOPE arrives from SG, don't just update the obviously affected tests. 
 ## Rule 15: Triage failures by checking test model against scope — in that order
 When TFR-BTA-NNN arrives: (1) read the test case, (2) read the scope section it traces to, (3) compare. If test case = scope and scope is clear → build defect. If test case = scope but scope is ambiguous → escalate. If test case ≠ scope → test model defect. Do this in order, every time.
 
-## Rule 16: Distinguish the three Phase 2s in test design (U9)
-Test cases must reference the correct Phase 2. System Phase 2 (LLM modes), build quality checks (DB construction quality), Phase 2 of corrections (next cycle).
+## Rule 16: Disambiguate overloaded terms in test design (U9)
+When a project has overloaded terminology, test cases must reference the correct meaning. Use the disambiguation table from UNIVERSAL. Ambiguous test cases produce ambiguous failures — triage becomes impossible.
 
 ## Rule 17: Check what the scope says before proposing new test mechanisms (mirror of seed)
 Before proposing a new test type or validation approach, verify whether the existing test model structure already covers the case.

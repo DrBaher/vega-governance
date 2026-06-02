@@ -6,7 +6,7 @@
 - 17 failures in last formal run (15 cross-axis, 1 Domain Expert dependent, 1 CLDL)
 
 ## Known pattern alerts
-- Cross-axis contamination: watch for demotion instead of disambiguation_rule
-- mock framework: L2.2 incident precedent
+- Cross-axis contamination: watch for data demotion instead of implementing required logic
+- mock framework: prior incident where all tests passed while testing nothing
 - Manual data seeding: check pipeline implementation, not just data presence
 - Bulk sudden passes: suspicious — verify mechanism, not just output

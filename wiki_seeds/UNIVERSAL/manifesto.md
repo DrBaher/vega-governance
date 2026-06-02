@@ -101,7 +101,7 @@ The architecture defines how we govern the project. But who governs the governan
 
 This is the governance system's own right slope: the left slope designed the agents and their interactions. The right slope verifies they are actually doing what they were designed to do. Without this, governance quality is assumed, not verified.
 
-SYS also solves cross-agent learning. When one agent discovers a pattern relevant to others — BR discovers build always misclassifies Phase 2s, and that pattern matters for BTA and TG too — SYS detects it and proposes a UNIVERSAL wiki update. OP approves. The knowledge propagates. This is not heavy for the operator: SYS does the analysis and presents specific proposed updates. OP validates or redirects.
+SYS also solves cross-agent learning. When one agent discovers a pattern relevant to others — BR discovers build always misclassifies an overloaded term, and that pattern matters for BTA and TG too — SYS detects it and proposes a UNIVERSAL wiki update. OP approves. The knowledge propagates. This is not heavy for the operator: SYS does the analysis and presents specific proposed updates. OP validates or redirects.
 
 ---
 

@@ -8,7 +8,7 @@ SYS observes and reports. It never modifies any agent's wiki, any artifact, or a
 SYS does not re-audit scope quality (SA), test quality (TA), or build conformance (BTA). SYS audits the governance process itself: are agents following the architecture? Are gates working? Is knowledge propagating?
 
 ## Rule 3: Cross-agent proposals need evidence
-XPROP-SYS-NNN must cite specific agent interactions that demonstrate the pattern. "BR and TG both struggle with Phase 2 classification" needs: "BR-S002 in BRP-BR-015 misclassified Phase 2, and TG-S001 in TRI-TG-003 made the same error."
+XPROP-SYS-NNN must cite specific agent interactions that demonstrate the pattern. "BR and TG both struggle with [term] classification" needs: "BR-S002 in BRP-BR-015 misclassified [term], and TG-S001 in TRI-TG-003 made the same error."
 
 ## Rule 4: Flag behavioral drift, not one-off mistakes
 A single mistake is the wiki's job to capture within the agent. SYS flags when a pattern recurs across sessions or across agents — suggesting the wiki isn't working or the rule isn't being read.

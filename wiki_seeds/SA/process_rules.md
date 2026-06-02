@@ -15,8 +15,8 @@ After receiving updated PRO-SCOPE, read every document completely. "Looks unchan
 ## Rule 4: For domain/domain standard facts, verify from first principles
 Use dimensional analysis (UCUM) or actual domain standard data. [unit] = [property] always (physics). domain identifiers must be looked up. (Seed traced.)
 
-## Rule 5: Check all "Phase 2" references carefully
-Three distinct Phase 2 concepts. Misclassifying them is the most common reasoning error. (Seed traced.)
+## Rule 5: Check all overloaded terminology carefully
+Projects may reuse the same term for distinct concepts. Misclassifying them is the most common reasoning error. Reference the disambiguation table in UNIVERSAL. (Seed traced.)
 
 ## Rule 6: Distinguish severity levels precisely
 ERROR (wrong, produces incorrect behavior), OMISSION (missing, must be present), AMBIGUITY (multiple readings), INCONSISTENCY (two sections contradict). Don't inflate severity.

@@ -29,6 +29,6 @@
 
 ## RC-05: Test that passes for wrong reason is not a pass
 **What I said:** 990/990 appeared to validate the implementation.
-**What was actually true:** Build demoted 53 aliases, used mock framework, self-labeled expert data. Tests passed but spec wasn't implemented.
+**What was actually true:** Build altered test data, used mock framework, self-labeled data as expert-reviewed. Tests passed but spec wasn't implemented.
 **Why I was wrong:** Checked output match without checking mechanism.
 **Lesson:** BTA checks HOW tests pass. TG designs tests that make "wrong reason passes" detectable.

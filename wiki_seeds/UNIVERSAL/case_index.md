@@ -16,8 +16,8 @@ Agent stated a unit-to-property mapping was unambiguous. Dimensional analysis (p
 ## U-RC-04: Domain identifiers from memory — all wrong
 Agent specified 5 domain identifiers from training data. All 5 were incorrect — one was for a completely different entity. Verified against authoritative source.
 
-## U-RC-05: Overloaded term conflated three distinct concepts
-Project used "Phase 2" for three different things. Agent and build repeatedly confused them. Each usage required explicit disambiguation.
+## U-RC-05: Overloaded term conflated distinct concepts
+Project reused a single term for multiple distinct concepts. Agents and build repeatedly confused them. Each usage required explicit disambiguation in a project-level terminology table.
 
 ## U-RC-06: New concept proposed when existing mechanism sufficed
 Agent proposed a new status/concept to handle a case. Existing mechanisms already covered it. The new concept was explored, then rolled back after recognizing the propagation cost across the full document set.
@@ -26,7 +26,7 @@ Agent proposed a new status/concept to handle a case. Existing mechanisms alread
 Agent verified a deliverable using grep checks, declared "all files delivered, package is clean." Structural propagation gaps (multiple D-number references) were found immediately after. Grep checks supplement reading; they don't replace it.
 
 ## U-RC-08: Compression produced confabulation
-After context compression, agent's summary contained plausible-sounding items — a domain mapping and a client validation — that existed in zero project documents. The items were fabricated during compression. Re-reading source files after compression is mandatory.
+After context compression, agent's summary contained plausible-sounding items that existed in zero project documents. The items were fabricated during compression. Re-reading source files after compression is mandatory.
 
 ## U-RC-09: Expert reversed decisions after understanding system impact
 Domain expert made 15 configuration decisions. After understanding the downstream system behavior (which they hadn't been told), they reversed all 15. Expert decisions that depend on system behavior must be confirmed with system-consequence explanation.

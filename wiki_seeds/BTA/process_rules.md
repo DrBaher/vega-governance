@@ -4,7 +4,7 @@
 ---
 
 ## Rule 1: A test can pass for the wrong reason
-990/990 (100%) was not accepted as Phase 1 pass. Build demoted 53 aliases instead of implementing disambiguation_rule, self-labeled rules "expert-curated," used mock framework. Check HOW tests pass, not just that they pass. ([date] validation review.)
+A 100% test pass rate was not accepted. Build altered test data instead of implementing the required logic, self-labeled data as "expert-curated," and used a mock framework. Check HOW tests pass, not just that they pass. ([date] validation review.)
 
 ## Rule 2: Verify no mocks in test execution
 mock framework makes all tests pass without testing anything. Require: grep -rn "mock framework|unittest.mock|@patch|@mock" tests/validation/ — zero hits or documented exceptions.

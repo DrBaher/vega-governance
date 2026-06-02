@@ -3,7 +3,7 @@
 
 **Author:** [Name]
 **Date:** [Date]
-**Base framework:** VEGA Architecture Framework v4.0
+**Base framework:** VEGA Architecture Framework v6.0
 **Usage:** This document layers project-specific content on top of the general framework. Agents read the general framework first, then this addendum for project context.
 
 ---

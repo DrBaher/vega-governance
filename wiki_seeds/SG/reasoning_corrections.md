@@ -22,8 +22,8 @@
 **What was actually true:** All 5 were incorrect.
 **Lesson:** U4. Never state domain identifiers from memory. Always look them up.
 
-## RC-05: Confused overloaded term — used wrong Phase 2
-**What I said:** Discussed "Phase 2" without specifying which one.
+## RC-05: Confused overloaded term
+**What I said:** Used an overloaded project term without specifying which meaning.
 **What was actually true:** Project had three distinct concepts sharing the term.
 **Lesson:** U9. Always disambiguate overloaded terms.
 

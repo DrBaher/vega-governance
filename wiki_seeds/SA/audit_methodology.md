@@ -15,7 +15,7 @@
 - Version alignment: all cross-document version references are current
 
 ## Known cross-reference traps
-- process spec.3 (build quality checks quality checks) ≠ SOP-16 (domain plausibility). Different SOPs, different mechanisms.
+- Build quality checks ≠ domain plausibility validation. Different procedures, different mechanisms. Don't conflate them.
 - §3.9 Catalog Validator (exact assembled_code) ≠ §3.10 Code Selector (compatibility matching, UNASSIGNED = wildcard)
 - [decision] (97 classes) and [decision] (H&P.HX excluded, H&P.HX.LAB included)
 - §5.6 "exact lookup" means different things per field (tube/unit → mapping tables; specimen/method → reference databases)
