@@ -540,15 +540,14 @@ def _generate_system_prompts() -> None:
     missing prompt at execute time), this gives the operator a clear path:
     `python main.py --init-only` re-runs this step.
     """
+    from executor import FRAMEWORK_FILENAMES, _first_existing
     framework_dir = Path(getattr(config, "FRAMEWORK_DIR",
                                  Path(config.BASE_DIR) / "framework"))
-    # Prefer v5; fall back to v4 for back-compat with older deployments.
-    framework_md = framework_dir / "VEGA_Architecture_Framework_v5.md"
-    if not framework_md.exists():
-        framework_md = framework_dir / "VEGA_Architecture_Framework_v4.md"
-    if not framework_md.exists():
+    # Prefer v6, then v5, then v4 (Spec v5 §14 / audit #12).
+    framework_md = _first_existing(framework_dir, FRAMEWORK_FILENAMES)
+    if framework_md is None:
         print(f"[init] WARNING — framework not found in {framework_dir} "
-              "(looked for v5 then v4). System prompts will NOT be generated. "
+              "(looked for v6/v5/v4). System prompts will NOT be generated. "
               "Place the framework markdown there and re-run with --init-only.")
         return
 
