@@ -117,6 +117,25 @@ class CycleManager:
                 return cycle
         return None
 
+    def get_active_by_artifact(self, artifact_id: str) -> Cycle | None:
+        """Find the active cycle opened by `artifact_id` (Spec §6.2). Used by the
+        cycle-internal exchange dispatch (vega_exchange, §12.3) to attach a turn
+        to the right cycle from just the opening artifact's id."""
+        for cycle in self._all_active():
+            if cycle.opening_artifact == artifact_id:
+                return cycle
+        return None
+
+    def get_by_id(self, cycle_id: str) -> Cycle | None:
+        """Load an active cycle by its id (e.g. for execute_cycle_turn dispatch)."""
+        path = self.active_dir / _cycle_filename(cycle_id)
+        if not path.exists():
+            return None
+        try:
+            return self._load(path)
+        except Exception:
+            return None
+
     def get_active_by_type(self, cycle_type: str) -> Cycle | None:
         for cycle in self._all_active():
             if cycle.type == cycle_type:
@@ -267,9 +286,35 @@ class CycleManager:
 
     # ─── Cycle continuation context monitoring ───────────────────────────────
 
-    def append_turn(self, cycle: Cycle, user_msg: dict, assistant_msg: dict) -> None:
+    def append_turn(self, cycle: Cycle, user_msg, assistant_msg=None) -> None:
+        """Append turn(s) to a cycle. Two shapes (Spec §6.2-§6.4):
+
+        - Pair shape — ``append_turn(cycle, user_dict, assistant_dict)``: records
+          a full request/response turn. Used by the executor after a normal
+          cycle execution (one user message + one assistant message).
+
+        - Single cycle-internal exchange turn — ``append_turn(cycle, text, role)``:
+          records ONE user turn (Spec §6.4 / §10.2 / §12.3). `text` is a str and
+          the third positional arg is the role label (e.g. "OP", "ADMIN_OP").
+          Used by the Telegram/MCP freeform handlers so an exchange turn is added
+          to the cycle's messages array WITHOUT minting or routing an artifact.
+          The speaker label is folded into the message text so it survives in the
+          cycle archive for SYS audit (and so the partner agent sees who spoke).
+        """
+        if isinstance(user_msg, str):
+            role = assistant_msg or "user"
+            cycle.messages.append({"role": "user", "content": f"[{role}] {user_msg}"})
+            self._save(cycle)
+            return
         cycle.messages.append(user_msg)
         cycle.messages.append(assistant_msg)
+        self._save(cycle)
+
+    def append_assistant_turn(self, cycle: Cycle, text: str) -> None:
+        """Append a single assistant turn (Spec §6.4 — the partner agent's reply
+        to a cycle-internal exchange turn). Counterpart to the single-turn
+        ``append_turn(cycle, text, role)`` used for the inbound side."""
+        cycle.messages.append({"role": "assistant", "content": text})
         self._save(cycle)
 
     def compress_early_turns(self, cycle: Cycle, keep_recent: int = 6) -> int:

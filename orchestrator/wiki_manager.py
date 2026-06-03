@@ -282,15 +282,43 @@ class WikiManager:
         return threshold_tripped
 
     def apply_universal_update(self, update: WikiUpdate) -> None:
-        """SYS writes to UNIVERSAL (autonomous per D-ARCH-031)."""
+        """SYS writes to UNIVERSAL (autonomous per D-ARCH-031).
+
+        Spec v5 §8.2 / audit P1-3: UNIVERSAL writes get the SAME diff logging as
+        own-wiki writes. UNIVERSAL is read by all 9 agents on every execution, so
+        silent SYS edits have systemic impact with no audit trail. We log to
+        SYS/wiki/log.md (where SYS sees its own write history) and mirror to
+        universal/log.md so the change is discoverable from the UNIVERSAL side too.
+        """
         path = self.universal_dir / update.file
         path.parent.mkdir(parents=True, exist_ok=True)
         if update.action == "replace_section" and update.section:
+            before = _read_section(path, update.section)
             _replace_section(path, update.section, update.content)
+            self._log_universal(
+                f"UNIVERSAL_REPLACE | {update.file} § {update.section} | "
+                f"Justification: {update.justification or 'NONE PROVIDED'} | "
+                f"Before: {before[:200]}... | After: {update.content[:200]}..."
+            )
         elif update.action == "append":
             atomic_append(path, _ensure_trailing_blank(update.content))
+            self._log_universal(
+                f"UNIVERSAL_APPEND | {update.file} | {update.content[:200]}..."
+            )
         else:
             atomic_append(path, "\n\n" + _ensure_trailing_blank(update.content))
+            self._log_universal(
+                f"UNIVERSAL_NEW_ENTRY | {update.file} | {update.content[:200]}..."
+            )
+
+    def _log_universal(self, message: str) -> None:
+        """Record a UNIVERSAL write to SYS's own log and mirror to the UNIVERSAL
+        log so the change is visible from both sides (audit P1-3)."""
+        self.append_log("SYS", LogEntry(message))
+        universal_log = self.universal_dir / "log.md"
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        atomic_append(universal_log, f"## [{ts}] SYS | {message}\n")
 
     def append_log(self, agent_code: str, entry: LogEntry) -> None:
         from datetime import datetime, timezone

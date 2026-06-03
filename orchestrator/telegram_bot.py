@@ -32,7 +32,7 @@ from cycle_manager import CycleManager
 from models import Artifact, PRIORITY_EMOJI, utcnow_iso
 from op_backlog import OPBacklog, make_auth
 from sequence_manager import InstanceManager, ModelAssignmentManager, SequenceManager
-from state_manager import load_json
+from state_manager import flag_for_execution, load_json
 from wiki_manager import WikiManager
 
 if TYPE_CHECKING:
@@ -174,6 +174,21 @@ class TelegramBot:
             f"{_summary(artifact)}\n\n"
             f"_When the {target} responds, forward via_ "
             f"`/build <msg>` _or_ `/expert <msg>`."
+        )
+        await self.send(msg)
+
+    async def relay_exchange_reply(self, agent_code: str, cycle_id: str,
+                                   text: str) -> None:
+        """Relay a partner agent's cycle-internal exchange reply to OP (Spec §6.4).
+
+        The reply is a conversational turn (no artifact), so it doesn't flow
+        through notify(); we surface it directly. If the same turn also produced
+        a formal artifact (e.g. SG closes the exchange with an AUTH), that rides
+        the normal routing + notification path on the next tick."""
+        msg = (
+            f"💬 *{agent_code} response* (cycle {cycle_id})\n\n"
+            f"{text}\n\n"
+            f"Reply to continue, or `/approve` / `/reject` / `/modify`."
         )
         await self.send(msg)
 
@@ -593,8 +608,9 @@ class TelegramBot:
         if not path:
             await self._reply(update, f"No backlog item for {gov_id}")
             return
-        # Move GOV to resolved (op_backlog.resolve handles pending→resolved)
-        self.op_backlog.resolve(gov_id)
+        # Move GOV to resolved with the action note (op_backlog.resolve handles
+        # pending→resolved + appends the resolution text per Spec v5 §10.1 / P1-1).
+        self.op_backlog.resolve(gov_id, resolution=action)
         # Close the gov_exchange cycle opened on this GOV (Spec v4 §6.1).
         self.cycles.close_by_artifact(gov_id)
         await self._reply(
@@ -707,38 +723,38 @@ class TelegramBot:
     # ─── Free-text → SG exchange ─────────────────────────────────────────────
 
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Spec v4 §10.2 + §6.1 prop_exchange — multi-turn OP↔SG dialogue.
+        """Spec v5 §6.4 + §10.2 — multi-turn OP↔SG PROP exchange, cycle-internal.
 
-        Free-text from OP during an active PROP exchange routes through the
-        router (audit MEDIUM Fix 2) so the continuation turn is archived and
-        appears in routing_log like every other artifact. The PROP-OP-NNN
-        artifact's references field points to the original PROP so SG's
-        executor picks up the active cycle via get_active_cycle, and the
-        cycle's messages array carries the conversation history.
+        Free-text from OP during an active PROP exchange is NOT a standalone
+        artifact (audit P1-2; Spec §6.4: "Exchange turns within a cycle are NOT
+        standalone artifacts. They are turns in the cycle's messages array.").
+        The turn is appended to the prop_exchange cycle and SG is flagged for
+        execution — no PROP-OP-NNN is minted and nothing is routed. SG's reply
+        rides back to OP via the main loop's exchange relay.
         """
-        in_progress = self.op_backlog.list_in_progress()
-        if not in_progress:
+        # Engage the in-progress exchange; first freeform message on a pending
+        # item starts the exchange (Spec §10.2).
+        current = self.op_backlog.get_in_progress()
+        if not current:
+            pending = self.op_backlog.list_pending()
+            if pending:
+                current = pending[0]
+                self.op_backlog.start_exchange(current.id)
+        if not current:
             await self._reply(update,
                 "No active exchange. Use /pending to see queue, /help for commands."
             )
             return
-        if self.router is None:
-            await self._reply(update, "Router not wired — cannot forward.")
+        cycle = self.cycles.get_active_cycle("SG", current)
+        if not cycle:
+            await self._reply(update,
+                f"No active cycle for {current.id} — cannot forward freeform text."
+            )
             return
-        current = in_progress[0]
         text = update.message.text
-        from models import Artifact as A
-        artifact_id = await self.sequences.next_id("OP", "PROP")
-        exchange_msg = A(
-            type="PROP",
-            sender="OP",
-            recipient="SG",
-            content=f"OP exchange message (re: {current.id}):\n\n{text}",
-            references=[current.id],
-            id=artifact_id,
-        )
-        await self.router.route(exchange_msg)
-        await self._reply(update, f"↩️ {artifact_id} forwarded to SG.")
+        self.cycles.append_turn(cycle, text, "OP")
+        flag_for_execution(self.state_dir, "SG", cycle.id)
+        await self._reply(update, "↩️ Forwarded to SG.")
 
     # ─── Thinking lookup ─────────────────────────────────────────────────────
 

@@ -78,14 +78,11 @@ ROUTING_TABLE: dict[tuple[str, ...], list[dict[str, str]]] = {
     # request / question from OP to SG. Triggered by /request or vega_request.
     ("OP",  "REQ"):           [{"to": "SG"}],
 
-    # PROP exchange continuation (Spec v4 §6.1 prop_exchange).
-    # During an active PROP exchange cycle, free-text OP messages from
-    # Telegram (or vega_exchange) are minted as PROP-OP-NNN turns and
-    # routed to SG. The cycle's messages array carries the conversation
-    # context; the artifact is the inbox trigger that lets SG execute on
-    # the next tick. Without a routing entry the artifact would hit
-    # _handle_unknown and auto-GOV the exchange.
-    ("OP",  "PROP"):          [{"to": "SG"}],
+    # NOTE: there is intentionally NO ("OP", "PROP") route. PROP exchange
+    # continuation turns are cycle-internal per Spec v5 §6.4 (audit P1-2) —
+    # appended to the prop_exchange cycle's messages array and dispatched via
+    # flag_for_execution, never minted as artifacts or routed. The old workaround
+    # route existed only to suppress auto-GOV for the (now removed) deviation.
 }
 
 
@@ -128,11 +125,31 @@ EXTERNAL_TARGETS = {"EXT", "DE", "ARCHIVE"}
 class Router:
 
     def __init__(self, store: ArtifactStore, state_dir: str | Path,
-                 op_backlog=None, telegram_bot=None) -> None:
+                 op_backlog=None, telegram_bot=None, cycles=None) -> None:
         self.store = store
         self.routing_log = Path(state_dir) / "routing_log.json"
         self.op_backlog = op_backlog
         self.telegram_bot = telegram_bot
+        # CycleManager — used to stamp routing_log entries with the active
+        # cycle id (audit NEW-1; Spec §17.2). Optional so the Router can still
+        # be constructed in tests/bootstrap before cycles exist.
+        self.cycles = cycles
+
+    def _cycle_id_for(self, artifact: Artifact,
+                      recipients: list[str] | None = None) -> str | None:
+        """Best-effort active-cycle lookup for routing_log stamping (audit NEW-1,
+        Spec §17.2). Returns None when no CycleManager is wired or no active
+        cycle involves this artifact. Tries the recipients first (the artifact
+        is usually a turn *into* a cycle), then the sender."""
+        if self.cycles is None:
+            return None
+        for agent in list(recipients or []) + [artifact.sender]:
+            if not agent:
+                continue
+            cycle = self.cycles.get_active_cycle(agent, artifact)
+            if cycle:
+                return cycle.id
+        return None
 
     def _key_for(self, artifact: Artifact) -> tuple[str, ...]:
         if artifact.type == "REJ":
@@ -163,7 +180,8 @@ class Router:
         if op_key in OP_BOUND_TYPES:
             await self._route_to_op(artifact, OP_BOUND_TYPES[op_key])
             self.store.archive_artifact(artifact)
-            await self._append_log(artifact, routed_to=["OP"])
+            await self._append_log(artifact, routed_to=["OP"],
+                                   cycle_id=self._cycle_id_for(artifact, ["OP"]))
             return
 
         key = self._key_for(artifact)
@@ -184,7 +202,8 @@ class Router:
 
         # Archive after delivery
         self.store.archive_artifact(artifact)
-        await self._append_log(artifact, routed_to=recipients)
+        await self._append_log(artifact, routed_to=recipients,
+                               cycle_id=self._cycle_id_for(artifact, recipients))
 
     async def _route_to_op(self, artifact: Artifact, spec: dict[str, Any]) -> None:
         """Place in OP backlog; attempt Telegram notify. Notify failures must
@@ -217,9 +236,17 @@ class Router:
         if self.op_backlog is not None:
             self.op_backlog.add(gov)
         if self.telegram_bot is not None:
-            await self.telegram_bot.notify(gov)
+            # Audit NEW-3 / Spec §10.2: Telegram notify failures must NOT break
+            # archival or routing_log of the offending artifact. _route_to_op
+            # already guards its notify; _handle_unknown must too.
+            try:
+                await self.telegram_bot.notify(gov)
+            except Exception as e:
+                print(f"[router] Telegram notify failed for auto-GOV {gov.id}: "
+                      f"{type(e).__name__}: {e}", flush=True)
         self.store.archive_artifact(artifact)
-        await self._append_log(artifact, routed_to=["GOV_VIOLATION"])
+        await self._append_log(artifact, routed_to=["GOV_VIOLATION"],
+                               cycle_id=self._cycle_id_for(artifact))
 
     async def _append_log(self, artifact: Artifact, routed_to: list[str],
                           cycle_id: str | None = None) -> None:

@@ -34,7 +34,7 @@ from op_backlog import OPBacklog
 from sequence_manager import (
     InstanceManager, ModelAssignmentManager, SequenceManager,
 )
-from state_manager import load_json
+from state_manager import flag_for_execution, load_json
 from wiki_manager import WikiManager
 
 
@@ -135,32 +135,32 @@ class MCPTools:
         return await self.process_disposition(artifact_id, "modify", instructions)
 
     async def vega_exchange(self, artifact_id: str, message: str) -> str:
-        """Multi-turn SG↔OP or SYS↔OP dialogue (Spec v4 §12.2).
+        """Multi-turn SG↔OP or SYS↔OP dialogue (Spec v5 §6.4 + §12.3).
 
-        Mints PROP-OP-NNN, routes via router so the continuation turn is
-        archived and shows up in routing_log. The agent picks up the active
-        cycle via references field.
+        Cycle-internal (audit P1-2): the turn is appended to the cycle opened by
+        `artifact_id` and the partner agent is flagged for execution. NO artifact
+        is minted and nothing is routed (Spec §6.4). The partner's reply is
+        relayed back through the main loop / notification channel.
         """
-        if self.router is None:
-            return "router not wired"
-        artifact_id_new = await self.sequences.next_id("OP", "PROP")
-        msg = Artifact(
-            type="PROP",
-            sender="OP",
-            recipient="SG",
-            content=f"OP exchange message (re: {artifact_id}):\n\n{message}",
-            references=[artifact_id],
-            id=artifact_id_new,
-        )
-        await self.router.route(msg)
-        return f"{artifact_id_new} forwarded to SG"
+        cycle = self.cycles.get_active_by_artifact(artifact_id)
+        if cycle is None:
+            return f"No active cycle for {artifact_id}"
+        # Partner = the non-OP participant (SG for prop_exchange, SYS for
+        # gov_exchange). primary_agent records exactly that.
+        partner = cycle.primary_agent or next(
+            (p for p in cycle.participants if p != "OP"), "SG")
+        role = "OP"
+        self.cycles.append_turn(cycle, message, role)
+        flag_for_execution(self.state_dir, partner, cycle.id)
+        return f"Message added to {cycle.id}. {partner} will respond."
 
     async def vega_resolve(self, gov_id: str, action: str = "acknowledged") -> str:
         """Close an active GOV exchange (Spec v4 §6.1 + §12.2)."""
         path = self.op_backlog.find(gov_id)
         if not path:
             return f"No backlog item for {gov_id}"
-        self.op_backlog.resolve(gov_id)
+        # Spec v5 §10.1 / audit P1-1 — persist the action note with the item.
+        self.op_backlog.resolve(gov_id, resolution=action)
         self.cycles.close_by_artifact(gov_id)
         return f"{gov_id} resolved ({action}); gov_exchange cycle closed"
 

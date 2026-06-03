@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from models import Artifact, utcnow_iso
-from state_manager import atomic_write
+from state_manager import atomic_append, atomic_write
 
 
 class OPBacklog:
@@ -65,13 +65,21 @@ class OPBacklog:
         shutil.move(src, dst)
         return dst
 
-    def resolve(self, artifact_id: str) -> Path:
-        """Mark in-progress → resolved. Caller is responsible for emitting AUTH."""
+    def resolve(self, artifact_id: str, resolution: Optional[str] = None) -> Path:
+        """Mark in-progress → resolved. Caller is responsible for emitting AUTH.
+
+        Spec v5 §10.1 (lines 1295-1302) / audit P1-1: when `resolution` text is
+        provided (e.g. the action note from `/resolve <GOV> <action>`), append it
+        to the resolved file so there is a durable record of *why* the item was
+        closed. SYS reads this in the cycle archive at its next audit.
+        """
         for src_dir in (self.in_progress, self.pending):
             src = src_dir / f"{artifact_id}.md"
             if src.exists():
                 dst = self.resolved / f"{artifact_id}.md"
                 shutil.move(src, dst)
+                if isinstance(resolution, str) and resolution:
+                    atomic_append(dst, f"\n---\nResolution: {resolution}\n")
                 return dst
         raise FileNotFoundError(f"OP item not in pending or in_progress: {artifact_id}")
 

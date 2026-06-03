@@ -100,26 +100,43 @@ def test_brq_route_exists():
     assert ROUTING_TABLE[("EXT", "BRQ")] == [{"to": "BR"}]
 
 
-# ─── PROP exchange continuation route + cycle ────────────────────────────────
+# ─── PROP exchange continuation is cycle-internal (Spec v5 §6.4 / audit P1-2) ──
 
-def test_op_prop_continuation_route_exists():
-    assert ("OP", "PROP") in ROUTING_TABLE
-    assert ROUTING_TABLE[("OP", "PROP")] == [{"to": "SG"}]
+def test_op_prop_continuation_route_removed():
+    """Spec v5 §6.4 (audit P1-2): exchange turns are NOT artifacts, so there must
+    be NO ("OP","PROP") route. The old workaround route is gone — an OP/PROP that
+    somehow reaches the router now falls through to the auto-GOV path."""
+    assert ("OP", "PROP") not in ROUTING_TABLE
 
 
 @pytest.mark.asyncio
-async def test_prop_continuation_routes_through_router(tmp_path):
-    """MEDIUM Fix 2 — _on_text-style PROP continuation goes through the
-    router; the synthetic id is minted via SequenceManager."""
-    router, store, _, state_dir = _make_router(tmp_path)
-    seqs = SequenceManager(state_dir)
-    artifact_id = await seqs.next_id("OP", "PROP")
-    a = Artifact(type="PROP", sender="OP", content="OP says X",
-                 references=["PROP-SG-001"], recipient="SG", id=artifact_id)
-    await router.route(a)
-    log = load_json(state_dir / "routing_log.json", default=[])
-    assert any(e["artifact_id"] == artifact_id and "SG" in e["routed_to"]
-               for e in log)
+async def test_prop_exchange_turn_is_cycle_internal(tmp_path):
+    """Audit P1-2 / Spec §6.4: a freeform OP exchange turn appends to the
+    prop_exchange cycle and flags SG — it mints NO PROP-OP-NNN artifact and
+    routes nothing through the router."""
+    from state_manager import drain_execution_flags, flag_for_execution
+
+    cycles = CycleManager(tmp_path / "cycles", tmp_path / "artifacts" / "archive")
+    state_dir = tmp_path / "state2"; state_dir.mkdir()
+    prop = Artifact(type="PROP", sender="SG", content="proposal",
+                    recipient="OP", id="PROP-SG-001")
+    cycle = cycles.open_cycle("prop_exchange", prop, ["SG", "OP"], primary_agent="SG")
+
+    # Simulate the freeform handler: append the turn + flag SG.
+    cycles.append_turn(cycle, "OP follow-up question", "OP")
+    flag_for_execution(state_dir, "SG", cycle.id)
+
+    # The cycle messages array grew with the OP turn (no artifact).
+    reloaded = cycles.get_by_id(cycle.id)
+    assert len(reloaded.messages) == 1
+    assert reloaded.messages[-1]["role"] == "user"
+    assert "OP follow-up question" in reloaded.messages[-1]["content"]
+
+    # SG was flagged for execution against this cycle.
+    flags = drain_execution_flags(state_dir)
+    assert {"agent": "SG", "cycle_id": cycle.id} in flags
+    # Draining clears the flags.
+    assert drain_execution_flags(state_dir) == []
 
 
 # ─── AUTH in routing_log after disposition ───────────────────────────────────

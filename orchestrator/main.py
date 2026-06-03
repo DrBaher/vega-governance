@@ -35,7 +35,9 @@ from sequence_manager import (
     InstanceManager, ModelAssignmentManager, SequenceManager,
 )
 from scheduling import is_daily_time, should_fire_sys
-from state_manager import LOCKS, atomic_save_json, atomic_write, load_json
+from state_manager import (
+    LOCKS, atomic_save_json, atomic_write, drain_execution_flags, load_json,
+)
 from telegram_bot import TelegramBot
 from wiki_manager import WikiManager
 
@@ -112,6 +114,7 @@ class Orchestrator:
             state_dir=config.STATE_DIR,
             op_backlog=self.op_backlog,
             telegram_bot=self.bot,
+            cycles=self.cycles,   # audit NEW-1 — stamp routing_log with cycle_id
         )
         self.bot.router = self.router
 
@@ -272,6 +275,29 @@ class Orchestrator:
                                 f"resolved."
                             )
                             self.paused_agents.add(agent)
+
+        # 2b. Cycle-internal exchange turns (Spec §6.4 / audit P1-2).
+        # Freeform OP/Admin-OP turns are appended to a cycle and the partner agent
+        # is flagged for execution — no artifact, no inbox item. Drain the flags
+        # and run each flagged cycle turn, then relay the agent's reply to OP.
+        for flag in drain_execution_flags(config.STATE_DIR):
+            agent_code = flag.get("agent")
+            cycle_id = flag.get("cycle_id")
+            if not agent_code or not cycle_id:
+                continue
+            if agent_code in self.paused_agents:
+                continue
+            try:
+                result = await self.executor.execute_cycle_turn(agent_code, cycle_id)
+            except Exception as e:
+                print(f"[main] cycle turn failed ({agent_code}/{cycle_id}): "
+                      f"{type(e).__name__}: {e}", flush=True)
+                continue
+            if isinstance(result, dict) and result.get("executed"):
+                self._execution_count += 1
+                reply = result.get("response_text")
+                if reply:
+                    await self.bot.relay_exchange_reply(agent_code, cycle_id, reply)
 
         # 3. SYS on schedule or threshold (Spec §13 + §5.6)
         if self._should_run_sys() or self.wiki.any_threshold_exceeded():
@@ -435,19 +461,27 @@ def initialize_project(initial_input_path: str | None = None) -> None:
 
     # Step 5 — place initial input in SG inbox
     if initial_input_path:
-        path = Path(initial_input_path)
-        if not path.exists():
-            raise FileNotFoundError(initial_input_path)
-        artifact = Artifact(
-            type="INIT",
-            sender="OP",
-            content=path.read_text(),
-            id="INIT-OP-001",
-            timestamp=utcnow_iso(),
-        )
-        store = ArtifactStore(config.AGENTS_DIR, config.ARTIFACTS_DIR)
-        store.inbox("SG").deliver(artifact)
-        print(f"[init] Placed initial input in SG inbox: {artifact.id}")
+        _place_initial_input(config, initial_input_path)
+
+
+def _place_initial_input(cfg, initial_input_path: str) -> None:
+    """Spec §14 step 5 / audit NEW-12 — archive INIT-OP-001 immutably and deliver
+    it to SG's inbox. The router isn't running yet, so without the manual archive
+    SYS has no immutable record of the bootstrap directive. Extracted for testing."""
+    path = Path(initial_input_path)
+    if not path.exists():
+        raise FileNotFoundError(initial_input_path)
+    artifact = Artifact(
+        type="INIT",
+        sender="OP",
+        content=path.read_text(),
+        id="INIT-OP-001",
+        timestamp=utcnow_iso(),
+    )
+    store = ArtifactStore(cfg.AGENTS_DIR, cfg.ARTIFACTS_DIR)
+    store.archive_artifact(artifact)        # Spec §14 lines 2486-2488 (NEW-12)
+    store.inbox("SG").deliver(artifact)
+    print(f"[init] Archived + placed initial input in SG inbox: {artifact.id}")
 
 
 def _generate_system_prompts() -> None:

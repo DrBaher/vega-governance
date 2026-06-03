@@ -78,6 +78,47 @@ def load_json(filepath: str | Path, default: Any = None) -> Any:
         return default if default is not None else {}
 
 
+# ─── Execution flags (cycle-internal exchange, Spec §6.4) ────────────────────
+#
+# Spec §6.4 / §10.2 / §12.3 use `flag_for_execution(agent)` as pseudocode to mean
+# "trigger this agent to run on the next tick without minting/routing an
+# artifact." Agent execution in this orchestrator is otherwise driven by
+# inbox.has_unprocessed(); a cycle-internal exchange turn appends to the cycle's
+# messages array (no artifact) and must still cause the partner agent to run.
+# These helpers back that flag with a small persisted queue the main loop drains
+# each tick. Each flag carries the cycle id so the executor runs the right cycle.
+
+_EXECUTION_FLAGS = "execution_flags.json"
+
+
+def flag_for_execution(state_dir: str | Path, agent: str, cycle_id: str) -> None:
+    """Queue `agent` to run its cycle `cycle_id` on the next tick (Spec §6.4).
+
+    Safe to call repeatedly — duplicate (agent, cycle_id) pairs are collapsed.
+    Single event loop → the load-modify-write below has no await and cannot
+    interleave with the main loop's drain.
+    """
+    path = Path(state_dir) / _EXECUTION_FLAGS
+    flags = load_json(path, default=[])
+    if not isinstance(flags, list):
+        flags = []
+    entry = {"agent": agent, "cycle_id": cycle_id}
+    if entry not in flags:
+        flags.append(entry)
+        atomic_save_json(path, flags)
+
+
+def drain_execution_flags(state_dir: str | Path) -> list[dict[str, str]]:
+    """Return and clear all pending execution flags (main loop, once per tick)."""
+    path = Path(state_dir) / _EXECUTION_FLAGS
+    flags = load_json(path, default=[])
+    if not isinstance(flags, list):
+        flags = []
+    if flags:
+        atomic_save_json(path, [])
+    return flags
+
+
 # ─── Lock registry ───────────────────────────────────────────────────────────
 
 class LockRegistry:

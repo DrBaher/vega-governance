@@ -48,6 +48,12 @@ _BLOCK_RE = re.compile(
 )
 
 
+def _strip_blocks(text: str) -> str:
+    """Return the conversational text outside ARTIFACT/WIKI_UPDATE/LOG_ENTRY
+    blocks — the human-facing reply for a cycle-internal exchange turn (§6.4)."""
+    return _BLOCK_RE.sub("", text).strip()
+
+
 def _split_block(block_text: str) -> tuple[dict[str, str], str]:
     """Split 'key: value\\n...\\n---\\n<content>' into (header dict, content)."""
     if "---" in block_text:
@@ -287,6 +293,120 @@ class AgentExecutor:
             "threshold_tripped": threshold_tripped,
         }
 
+    async def execute_cycle_turn(self, agent_code: str, cycle_id: str) -> dict[str, Any]:
+        """Run `agent_code` on a cycle whose trailing message is an unanswered
+        exchange turn (Spec §6.4 — cycle-internal exchange).
+
+        Unlike execute(), there is NO inbox item: the cycle's last message IS the
+        new user turn (appended by the Telegram/MCP freeform handler). The agent
+        sees the full cycle history, responds, and its reply is appended to the
+        cycle as an assistant turn. Any formal artifacts it emits (e.g. SG decides
+        to issue an AUTH/PROP, closing the exchange) go to the outbox and route
+        normally on the next tick. The conversational text is returned so the
+        main loop can relay it back to the human operator.
+        """
+        cycle = self.cycles.get_by_id(cycle_id)
+        if cycle is None or not cycle.messages:
+            return {"executed": False, "agent": agent_code, "reason": "no_cycle"}
+        # Only run if the trailing turn is an unanswered user turn.
+        if cycle.messages[-1].get("role") != "user":
+            return {"executed": False, "agent": agent_code, "reason": "no_pending_turn"}
+
+        start_ts = time.perf_counter()
+        try:
+            system_prompt = self._load_system_prompt(agent_code)
+        except FileNotFoundError as e:
+            self.wiki.append_log(agent_code, LogEntry(
+                f"CRITICAL | system_prompt.md missing — agent skipped. {e}"
+            ))
+            return {"executed": False, "agent": agent_code,
+                    "error": "missing_system_prompt", "message": str(e)}
+
+        wiki_content, entries_included = self.wiki.read_all(agent_code)
+        universal = self.wiki.read_universal(agent_code)
+        scope = self._load_scope(agent_code)
+        framework = self._load_framework_view(agent_code)
+        static_content = self._compose_static(
+            wiki_content=wiki_content, universal=universal,
+            scope=scope, framework=framework,
+        )
+        messages = self._build_cycle_continuation(cycle, static_content)
+        cycle.model = self.models.get(agent_code)
+
+        model = self.models.get(agent_code)
+        instance = self.instances.get_or_create(agent_code)
+        response, error = await self._call_with_retry(
+            model=model, system=system_prompt, messages=messages,
+        )
+        if error is not None:
+            self.wiki.append_log(agent_code, LogEntry(
+                f"ERROR | API call failed (cycle {cycle_id}): {error}"
+            ))
+            return {"executed": False, "agent": agent_code, "error": str(error)}
+
+        thinking_blocks, full_text = self._extract_response(response)
+        parsed = _parse_blocks(full_text)
+
+        artifacts: list[Artifact] = []
+        for header, content in parsed["ARTIFACT"]:
+            artifacts.append(await self._build_artifact(agent_code, header, content, instance, model))
+        wiki_updates: list[WikiUpdate] = []
+        for header, content in parsed["WIKI_UPDATE"]:
+            wiki_updates.append(self._build_wiki_update(agent_code, header, content))
+        log_entries: list[LogEntry] = [LogEntry(content) for _, content in parsed["LOG_ENTRY"]]
+
+        # Spec §15.2 — malformed if the agent produced signal but nothing parseable
+        # AND nothing conversational to relay.
+        conversational = _strip_blocks(full_text)
+        produced_signal = bool(full_text.strip()) or bool(thinking_blocks)
+        if not (artifacts or wiki_updates or log_entries or conversational) and produced_signal:
+            return await self._handle_malformed(agent_code, full_text, [])
+        await self._reset_malformed_counter(agent_code)
+
+        threshold_tripped = await self.wiki.apply_updates(agent_code, wiki_updates)
+        for entry in log_entries:
+            self.wiki.append_log(agent_code, entry)
+
+        # Record the agent's reply as the cycle's assistant turn (§6.4). Use the
+        # conversational text when present, else the full text (so a turn that
+        # only emits artifacts still records *something* in the dialogue).
+        self.cycles.append_assistant_turn(cycle, conversational or full_text)
+        used = self.cycles.estimate_tokens(cycle.messages)
+        limit = _model_context_limit(model)
+        if limit and used / limit > self.config.CYCLE_CONTEXT_WARNING:
+            usage_pct = used / limit
+            compressed = self.cycles.compress_early_turns(cycle)
+            if compressed > 0:
+                self.wiki.append_log(agent_code, LogEntry(
+                    f"CYCLE_COMPRESSION | {cycle.id} | Context at {usage_pct:.0%}, "
+                    f"compressed early turns (U-RC-08 warning: verify post-compression)"
+                ))
+
+        for artifact in artifacts:
+            self.store.outbox(agent_code).place(artifact)
+
+        consultation = ConsultationRecord(
+            agent=agent_code, instance=instance, timestamp=utcnow_iso(),
+            wiki_entries_included=entries_included,
+        )
+        duration_seconds = time.perf_counter() - start_ts
+        execution_id = await self._log_execution(
+            agent=agent_code, model=model, instance=instance,
+            inbox_items=[], artifacts=artifacts, wiki_updates=wiki_updates,
+            thinking_blocks=thinking_blocks, consultation=consultation,
+            cycle=cycle, tokens=getattr(response, "usage", None),
+            duration_seconds=duration_seconds,
+        )
+        await self._update_artifact_index(artifacts, execution_id)
+
+        return {
+            "executed": True, "agent": agent_code, "execution_id": execution_id,
+            "cycle_id": cycle.id, "response_text": conversational,
+            "artifacts": [a.id for a in artifacts],
+            "wiki_updates": len(wiki_updates),
+            "threshold_tripped": threshold_tripped,
+        }
+
     async def execute_sys(self, audit_request: str | None = None,
                           since: str | None = None) -> dict[str, Any]:
         """SYS execution.
@@ -357,9 +477,12 @@ class AgentExecutor:
         log_entries_parsed: list[tuple[dict, str]] = parsed["LOG_ENTRY"]
 
         # Spec §15.2 also applies to SYS — silently producing nothing for
-        # multiple daily audits is a signal OP must see.
-        if (not artifacts and not wiki_updates and not log_entries_parsed
-                and full_text.strip()):
+        # multiple daily audits is a signal OP must see. A SYS audit that
+        # returns thinking-only with empty visible text must also strike
+        # (audit NEW-2 — mirrors the execute() fix at line ~196 so the SYS
+        # path doesn't silently consume a thinking-only response).
+        produced_signal = bool(full_text.strip()) or bool(thinking_blocks)
+        if not (artifacts or wiki_updates or log_entries_parsed) and produced_signal:
             return await self._handle_malformed(agent_code, full_text, [])
         await self._reset_malformed_counter(agent_code)
 
@@ -489,6 +612,25 @@ class AgentExecutor:
                 ],
             }]
         return [{"role": "user", "content": static_content + "\n\n" + dynamic_content}]
+
+    def _build_cycle_continuation(self, cycle: Cycle,
+                                  static_content: str) -> list[dict[str, Any]]:
+        """Like _build_cycle_messages but with NO trailing dynamic turn — the
+        cycle's own last message is the new user turn (Spec §6.4 exchange)."""
+        if self.config.PROMPT_CACHING_ENABLED:
+            messages: list[dict[str, Any]] = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": static_content,
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "Cycle context follows."},
+                ],
+            }]
+        else:
+            messages = [{"role": "user", "content": static_content}]
+        for turn in cycle.messages:
+            messages.append(turn)
+        return messages
 
     def _build_cycle_messages(self, cycle: Cycle, static_content: str,
                               dynamic_content: str) -> list[dict[str, Any]]:
