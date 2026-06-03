@@ -36,7 +36,7 @@ DOCUMENT_TYPES = {
     "FND", "VR", "TFR", "ESC", "DEV",
     # Workflow
     "DOC", "VAL", "REV", "REJ", "TRI", "BRQ", "BRP", "TSR", "NOTE",
-    "PROP", "AUTH", "SUM", "GOV",
+    "PROP", "AUTH", "SUM", "GOV", "REQ",
     # External
     "DE_OUT", "DE_IN", "DE_SG",
     # Propagation
@@ -93,7 +93,7 @@ class Artifact:
     status: str = "unprocessed"                # unprocessed | processed | archived
     disposition: str | None = None             # AUTH only: approve | reject | modify
     modifications: str | None = None           # AUTH modify only
-    certificate: str | None = None             # VAL only: first | second (test lane)
+    certificate: str | None = None             # VAL only: full | build (test lane; "second" = legacy alias for build)
     filename: str | None = None                # set by ArtifactStore when persisted
 
     def to_markdown(self) -> str:
@@ -175,6 +175,8 @@ CYCLE_TYPES = {
     "build_test_qa",          # BR ↔ EXT
     "build_results",          # BR ↔ EXT
     "build_remediation",      # BR ↔ EXT
+    "de_qa",                  # SG ↔ DE  (opens on DE_OUT, closes on DE_IN)
+    "gov_exchange",           # SYS ↔ Admin OP  (opens on GOV, closes on /resolve)
 }
 
 
@@ -229,11 +231,15 @@ def make_gov(reason: str, sender: str = "SYS", priority: str = "P1",
     raises ValueError and the orchestrator crashes when SG produces an unexpected
     artifact type.
     """
+    import secrets
     import time
+    # Append a short random suffix so two unknown-key artifacts produced in the
+    # same millisecond by the same sender (possible under asyncio.gather) don't
+    # collide on the id and silently drop one at archive (audit NEW-4).
     return Artifact(
         type="GOV",
         sender=sender,
-        id=f"GOV-{sender}-AUTO-{int(time.time() * 1000)}",
+        id=f"GOV-{sender}-AUTO-{int(time.time() * 1000)}-{secrets.token_hex(2)}",
         content=f"## Auto-generated governance finding\n\n{reason}\n",
         priority=priority,
         references=references or [],

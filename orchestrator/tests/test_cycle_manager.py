@@ -41,6 +41,22 @@ def test_tcn_two_certificate_lifecycle(tmp_path):
     assert cm.get_cycle_by_participants("TG", "TE") is None
 
 
+def test_tcn_build_certificate_closes_cycle(tmp_path):
+    """Canonical Framework v5/v6 name is `build` (Spec §6.1); `second` is the
+    legacy alias covered above. This locks in the canonical name directly."""
+    cm = CycleManager(tmp_path / "active", tmp_path / "archive")
+    tcn = Artifact(type="TCN", sender="TG", id="TCN-TG-010", content="...")
+    cm.check_cycle_events(tcn, recipients=["TE"])
+    val_full = Artifact(type="VAL", sender="TG", id="VAL-TG-010",
+                        certificate="full", references=["TCN-TG-010"], content="ok")
+    cm.check_cycle_events(val_full, recipients=["TE"])
+    assert cm.get_cycle_by_participants("TG", "TE") is not None   # full doesn't close
+    val_build = Artifact(type="VAL", sender="TG", id="VAL-TG-011",
+                         certificate="build", references=["TCN-TG-010"], content="ok")
+    cm.check_cycle_events(val_build, recipients=["TE"])
+    assert cm.get_cycle_by_participants("TG", "TE") is None       # build closes
+
+
 def test_prop_opens_and_auth_closes_prop_exchange(tmp_path):
     cm = CycleManager(tmp_path / "active", tmp_path / "archive")
     prop = Artifact(type="PROP", sender="SG", id="PROP-SG-001", priority="P1", content="...")

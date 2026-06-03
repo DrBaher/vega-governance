@@ -205,7 +205,7 @@ def compose_system_prompt(
     if not role_body:
         raise ValueError(
             f"Could not extract §{section_num} ({name}) from framework. "
-            f"Verify framework/VEGA_Architecture_Framework_v4.md is intact."
+            f"Verify framework/VEGA_Architecture_Framework_v6.md (or v5/v4) is intact."
         )
 
     project_line = f"Project: {project_name}\n" if project_name else ""

@@ -51,8 +51,9 @@ def atomic_save_json(filepath: str | Path, data: Any) -> None:
 def load_json(filepath: str | Path, default: Any = None) -> Any:
     """Read JSON or return default if missing/empty.
 
-    Per Spec §15.4 — on JSON decode error, quarantine the corrupt file with a
-    `.corrupt-<unix-ms>` suffix and return the default. This keeps the
+    Defensive enhancement (not spec-mandated): on JSON decode error, quarantine
+    the corrupt file with a `.corrupt-<unix-ms>` suffix and return the default.
+    This keeps the
     orchestrator alive across partial-write crashes (the most common cause of
     corruption) while preserving forensic evidence. The caller logs the event
     via its own context.

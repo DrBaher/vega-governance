@@ -835,9 +835,18 @@ class AgentExecutor:
 
         # Prefer v6, then v5, then v4 (Spec v5 §14 / audit #12). If only the
         # legacy v4 is around, fall back to the full-framework loader so we don't
-        # ship an empty context.
+        # ship an empty context — but warn LOUDLY once: v4 lacks §12 tiering, so
+        # this ships the full ~30k-token framework to EVERY agent, including
+        # minimal-tier SE/TE, undoing the §12 cost savings (audit NEW-10 / #7).
         framework_path = _first_existing(framework_dir, FRAMEWORK_FILENAMES)
         if framework_path is None or framework_path.name.endswith("_v4.md"):
+            if not getattr(self, "_v4_fallback_warned", False):
+                self._v4_fallback_warned = True
+                print("[executor] ⚠ No v6/v5 framework found — falling back to the "
+                      "full-framework loader. Tiered context (§12) is DISABLED: the "
+                      "entire framework ships to every agent (incl. minimal-tier "
+                      "SE/TE). Upgrade framework/ to VEGA_Architecture_Framework_v6.md "
+                      "to restore per-role tiering.", flush=True)
             return self._load_framework()
 
         framework_text = framework_path.read_text()

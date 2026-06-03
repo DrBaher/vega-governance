@@ -23,7 +23,7 @@ def _read_text(path: str | Path) -> str:
 
 def _quarantine_corrupt(path: Path, err: Exception) -> None:
     """Move a corrupt artifact file out of the active set so it doesn't
-    poison repeated scans (Spec §15.4). The corrupt copy is preserved with
+    poison repeated scans (defensive enhancement, not spec-mandated). The corrupt copy is preserved with
     a `.corrupt-<unix-ms>` suffix for forensic review."""
     if not path.exists():
         return
@@ -56,7 +56,7 @@ class Inbox:
                 if self._load(path).status == "unprocessed":
                     return True
             except Exception as e:
-                # Spec §15.4 — quarantine corrupt inbox files; they'd otherwise
+                # defensive enhancement (not spec-mandated) — quarantine corrupt inbox files; they'd otherwise
                 # be re-scanned every tick and swallowed silently by the bare
                 # `continue`.
                 _quarantine_corrupt(path, e)
@@ -75,7 +75,7 @@ class Inbox:
             try:
                 a = self._load(path)
             except Exception as e:
-                _quarantine_corrupt(path, e)   # Spec §15.4
+                _quarantine_corrupt(path, e)   # defensive enhancement (not spec-mandated)
                 continue
             if a.status == "unprocessed":
                 artifacts.append(a)
@@ -124,7 +124,7 @@ class Outbox:
             try:
                 out.append(Artifact.from_markdown(_read_text(path), filename=path.name))
             except Exception as e:
-                _quarantine_corrupt(path, e)   # Spec §15.4
+                _quarantine_corrupt(path, e)   # defensive enhancement (not spec-mandated)
                 continue
         return out
 
@@ -157,17 +157,33 @@ class Archive:
                 existing = _read_text(path)
                 new_content = artifact.to_markdown()
                 if existing != new_content:
-                    print(f"[artifact_store] WARNING | Archive collision for "
-                          f"{artifact.id} — on-disk content differs from "
-                          f"incoming write; on-disk version preserved per "
-                          f"Spec §7.4 immutability rule. SYS should audit.",
+                    msg = (f"Archive collision for {artifact.id} — on-disk content "
+                           f"differs from incoming write; on-disk version preserved "
+                           f"per Spec §7.4 immutability rule.")
+                    print(f"[artifact_store] WARNING | {msg} SYS should audit.",
                           flush=True)
+                    # Persist to a SYS-discoverable governance log rather than only
+                    # stdout (audit NEW-14) — a genuine collision (same id, different
+                    # content) is an architectural signal SYS must be able to find.
+                    self._log_collision(msg)
             except OSError:
                 pass
             return path
         artifact.status = "archived"
         atomic_write(path, artifact.to_markdown())
         return path
+
+    def _log_collision(self, message: str) -> None:
+        """Append an archive-collision record to artifacts/archive_collisions.log
+        (alongside the immutable archive, never inside it) so SYS can surface it."""
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        log_path = self.dir.parent / "archive_collisions.log"
+        try:
+            with open(log_path, "a") as f:
+                f.write(f"{ts} | GOVERNANCE | {message}\n")
+        except OSError:
+            pass
 
     def load(self, artifact_id: str) -> Artifact | None:
         path = self.dir / f"{artifact_id}.md"
@@ -187,7 +203,7 @@ class Archive:
             try:
                 a = Artifact.from_markdown(_read_text(path), filename=path.name)
             except Exception as e:
-                _quarantine_corrupt(path, e)   # Spec §15.4
+                _quarantine_corrupt(path, e)   # defensive enhancement (not spec-mandated)
                 continue
             if since is None or a.timestamp > since:
                 out.append(a)

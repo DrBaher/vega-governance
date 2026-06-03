@@ -515,11 +515,15 @@ class TelegramBot:
 
     async def _cmd_sys(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Governance (SYS audits) is Admin OP's (Spec v5 §12.4).
-        if not await self._authorize(update, {"ADMIN_OP"}):
+        role = await self._authorize(update, {"ADMIN_OP"})
+        if not role:
             return
-        instruction = " ".join(ctx.args).strip() or None
+        instruction = " ".join(ctx.args).strip()
+        # Tag the audit source so SYS's record shows who requested it (audit
+        # NEW-13 — matters now roles are split: OP vs Admin OP).
+        tagged = f"[requested by {role} via Telegram] " + (instruction or "(no specific instruction)")
         await self._reply(update, "Triggering SYS audit…")
-        result = await self.sys_trigger(instruction)
+        result = await self.sys_trigger(tagged)
         await self._reply(update, f"SYS done: {result}")
 
     async def _cmd_wiki(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
