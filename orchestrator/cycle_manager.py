@@ -142,6 +142,64 @@ class CycleManager:
                 return cycle
         return None
 
+    # ─── Activity / pending / history (Spec §6.2 — DE/EXT + OP visibility) ────
+
+    ROLE_PARTICIPANTS = {"DE": ["SG", "DE"], "EXT": ["BR", "EXT"]}
+
+    def _load_archived_cycles(self, limit: int = 20) -> list[dict]:
+        """Most-recently-archived cycle dicts (raw, no Cycle reconstruction)."""
+        out: list[dict] = []
+        for path in sorted(self.archive_dir.glob("*.json"), reverse=True)[:limit]:
+            try:
+                out.append(json.loads(path.read_text()))
+            except Exception:
+                continue
+        return out
+
+    def get_activity_summary(self, cycle_type: str) -> list[dict]:
+        """Summaries of recent cycles of a type (active + up to 10 archived).
+        Backs vega_de_activity / vega_ext_activity (OP read-only visibility)."""
+        summaries: list[dict] = []
+        for cycle in self._all_active():
+            if cycle.type == cycle_type:
+                summaries.append({
+                    "id": cycle.id, "status": "active",
+                    "turns": len(cycle.messages), "opened": cycle.opened_at,
+                })
+        for cycle in self._load_archived_cycles():
+            if cycle.get("type") == cycle_type:
+                summaries.append({
+                    "id": cycle.get("id"), "status": "closed",
+                    "turns": len(cycle.get("messages", [])),
+                    "opened": cycle.get("opened_at"),
+                })
+                if len(summaries) >= 10:
+                    break
+        return summaries
+
+    def get_pending_for_role(self, role: str) -> list[Cycle]:
+        """Active cycles awaiting a response from this role (DE/EXT). A cycle is
+        pending for the role when its trailing turn came from the other party."""
+        participants = set(self.ROLE_PARTICIPANTS.get(role, []))
+        pending: list[Cycle] = []
+        for cycle in self._all_active():
+            if participants and participants.issubset(set(cycle.participants)):
+                last = cycle.messages[-1] if cycle.messages else None
+                # The other party speaks as the assistant turn into the cycle;
+                # an open user turn means the role itself still owes a reply.
+                if last is not None and last.get("role") == "assistant":
+                    pending.append(cycle)
+        return pending
+
+    def get_history_for_role(self, role: str) -> list[dict]:
+        """Closed (archived) cycles involving this role — backs *_history tools."""
+        participants = set(self.ROLE_PARTICIPANTS.get(role, []))
+        history: list[dict] = []
+        for cycle in self._load_archived_cycles():
+            if participants and participants.issubset(set(cycle.get("participants", []))):
+                history.append(cycle)
+        return history
+
     # ─── Event detection — open/close cycles on artifact produce ─────────────
 
     def check_cycle_events(self, artifact: Artifact, recipients: list[str]) -> None:

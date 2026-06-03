@@ -30,7 +30,7 @@ from telegram.ext import (
 from artifact_store import ArtifactStore
 from cycle_manager import CycleManager
 from models import Artifact, PRIORITY_EMOJI, utcnow_iso
-from op_backlog import OPBacklog, make_auth
+from backlog import OPBacklog, make_auth
 from sequence_manager import InstanceManager, ModelAssignmentManager, SequenceManager
 from state_manager import flag_for_execution, load_json
 from wiki_manager import WikiManager
@@ -92,6 +92,11 @@ class TelegramBot:
 
         # Set after construction (avoid circular import)
         self.router: Optional["Router"] = None
+        # RoleManager — set after construction. Enables role-scoped Telegram
+        # dispatch and per-role notification targeting (Spec v5 §10.2, §12.4).
+        self.role_manager = None
+        # Admin OP backlog — set after construction (GOV exchange, Spec §10.1).
+        self.admin_backlog = None
 
         self.app: Application | None = None
         self.chat_id = config.TELEGRAM_OP_CHAT_ID
@@ -113,12 +118,21 @@ class TelegramBot:
         while True:
             await asyncio.sleep(3600)
 
-    async def send(self, text: str) -> None:
-        """Send a message to OP. Falls back to plain text if Markdown parsing
-        fails on the artifact body (unescaped `_`, `*`, `[`, etc.). Truncates
-        anything over Telegram's 4096-char message limit, splitting at a
-        newline if possible."""
-        if not self.app or not self.chat_id:
+    async def send(self, text: str, role: str | None = None,
+                   chat_id: str | None = None) -> None:
+        """Send a message. Target resolution (Spec v5 §10.2/§12.4):
+          - explicit `chat_id` wins (used by role-scoped handlers replying to a
+            specific person, and by OTP/invite delivery);
+          - else `role` is resolved to a chat via the RoleManager;
+          - else the default OP chat (`config.TELEGRAM_OP_CHAT_ID`).
+        Falls back to plain text if Markdown parsing fails on the body; truncates
+        over Telegram's 4096-char limit, splitting at a newline if possible."""
+        target = chat_id
+        if target is None and role is not None and self.role_manager is not None:
+            target = self.role_manager.get_telegram_id(role)
+        if target is None:
+            target = self.chat_id
+        if not self.app or not target:
             print(f"[telegram-shim] {text}")
             return
 
@@ -134,15 +148,15 @@ class TelegramBot:
 
         try:
             await self.app.bot.send_message(
-                chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN,
+                chat_id=target, text=text, parse_mode=ParseMode.MARKDOWN,
             )
         except BadRequest as e:
             msg = str(e).lower()
             if "parse" in msg or "entities" in msg or "markdown" in msg:
                 # Artifact content has chars that broke Markdown (unescaped _, *,
-                # [, etc.). Resend as plain text so the message reaches OP.
+                # [, etc.). Resend as plain text so the message reaches the role.
                 await self.app.bot.send_message(
-                    chat_id=self.chat_id, text=text,
+                    chat_id=target, text=text,
                     # parse_mode omitted → plain text
                 )
             else:
@@ -150,7 +164,10 @@ class TelegramBot:
 
     # ─── Notifications ───────────────────────────────────────────────────────
 
-    async def notify(self, artifact: Artifact) -> None:
+    async def notify(self, artifact: Artifact, role: str | None = None) -> None:
+        """Notify a decision role of an inbound backlog item. `role` selects the
+        target chat (OP for PROP, ADMIN_OP for GOV) — Spec v5 §4.2 notify_role.
+        Falls back to the default OP chat when role routing isn't configured."""
         emoji = PRIORITY_EMOJI.get(artifact.priority or "P2", "🟡")
         thinking = self._latest_thinking(artifact)
         thinking_section = f"\n💭 _{artifact.sender} reasoning:_ {thinking}\n" if thinking else ""
@@ -164,18 +181,26 @@ class TelegramBot:
             f"`/reject {artifact.id} <reason>`\n"
             f"`/modify {artifact.id} <instructions>`"
         )
-        await self.send(msg)
+        await self.send(msg, role=role)
 
     async def notify_external_relay(self, artifact: Artifact, target: str) -> None:
-        """For EXT / DE relays. At launch: OP relays manually."""
+        """Notify a DE/EXT role of an inbound artifact (Spec v5 §12.5-§12.6).
+
+        DE and EXT are first-class roles now — they respond DIRECTLY via their own
+        role-scoped tools, not via an OP relay. The message is sent to the target
+        role's own chat (falling back to the default chat for unconfigured
+        single-operator deployments)."""
+        respond_cmd = {"DE": "/de_respond", "EXT": "/ext_submit"}.get(target)
+        hint = (f"_Respond via_ `{respond_cmd}`." if respond_cmd
+                else f"_Awaiting {target} response._")
         msg = (
-            f"📤 *Relay needed → {target}*\n"
+            f"📤 *For {target}*\n"
             f"*{artifact.id}* ({artifact.type})\n\n"
             f"{_summary(artifact)}\n\n"
-            f"_When the {target} responds, forward via_ "
-            f"`/build <msg>` _or_ `/expert <msg>`."
+            f"{hint}"
         )
-        await self.send(msg)
+        # Target the role's chat when role routing is configured; else default.
+        await self.send(msg, role=target if target in ("DE", "EXT") else None)
 
     async def relay_exchange_reply(self, agent_code: str, cycle_id: str,
                                    text: str) -> None:
@@ -204,6 +229,48 @@ class TelegramBot:
         )
         await self.send(msg)
 
+    # ─── Role resolution + authorization (Spec v5 §10.2/§12.4) ───────────────
+
+    def _is_unconfigured(self) -> bool:
+        """True when no roles are assigned yet — a single-operator deployment.
+        In that mode the configured OP chat acts as a superuser so the bot keeps
+        working before the role system is set up."""
+        if self.role_manager is None:
+            return True
+        try:
+            return not self.role_manager._load_roles()
+        except Exception:
+            return True
+
+    def _role_for_update(self, update: Update) -> str | None:
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if self.role_manager is not None:
+            role = self.role_manager.get_role_by_telegram(chat_id)
+            if role:
+                return role
+        if self._is_unconfigured() and str(chat_id) == str(self.chat_id):
+            return "OP"   # back-compat superuser
+        return None
+
+    async def _authorize(self, update: Update, allowed: set[str]) -> str | None:
+        """Return the caller's role if it is in `allowed`, else reply with a
+        refusal and return None. Unconfigured-deployment superuser (the default
+        OP chat) passes every gate so single-operator setups keep working."""
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if self._is_unconfigured() and str(chat_id) == str(self.chat_id):
+            return "ADMIN_OP"   # superuser: full access until roles are configured
+        role = self.role_manager.get_role_by_telegram(chat_id) if self.role_manager else None
+        if role is None:
+            await self._reply(update,
+                "Access not configured. Use MCP to request access via "
+                "`vega_request_access()`.")
+            return None
+        if role not in allowed:
+            await self._reply(update,
+                f"⛔ This command isn't available for your role ({role}).")
+            return None
+        return role
+
     # ─── Command handlers ────────────────────────────────────────────────────
 
     def _register_handlers(self, app: Application) -> None:
@@ -227,22 +294,37 @@ class TelegramBot:
         app.add_handler(CommandHandler("retry", self._cmd_retry))
         app.add_handler(CommandHandler("model", self._cmd_model))
         app.add_handler(CommandHandler("models", self._cmd_models))
-        app.add_handler(CommandHandler("build", self._cmd_build_relay))
-        app.add_handler(CommandHandler("expert", self._cmd_expert_relay))
         app.add_handler(CommandHandler("request", self._cmd_request))
         app.add_handler(CommandHandler("resolve", self._cmd_resolve))
         app.add_handler(CommandHandler("routing", self._cmd_routing))
         app.add_handler(CommandHandler("decisions", self._cmd_decisions))
         app.add_handler(CommandHandler("framework", self._cmd_framework))
         app.add_handler(CommandHandler("cycles", self._cmd_cycles))
-        # Fall-through: non-slash messages forward to active PROP exchange
+        # Admin OP — role management + notification config (Spec v5 §12.4)
+        app.add_handler(CommandHandler("role", self._cmd_role))
+        app.add_handler(CommandHandler("roles", self._cmd_roles))
+        app.add_handler(CommandHandler("config_notify", self._cmd_config_notify))
+        # DE — domain expertise direct with SG (Spec v5 §12.6)
+        app.add_handler(CommandHandler("de_respond", self._cmd_de_respond))
+        app.add_handler(CommandHandler("de_observe", self._cmd_de_observe))
+        app.add_handler(CommandHandler("de_pending", self._cmd_de_pending))
+        app.add_handler(CommandHandler("de_history", self._cmd_de_history))
+        # EXT — build interaction direct with BR (Spec v5 §12.5)
+        app.add_handler(CommandHandler("ext_submit", self._cmd_ext_submit))
+        app.add_handler(CommandHandler("ext_ask", self._cmd_ext_ask))
+        app.add_handler(CommandHandler("ext_pending", self._cmd_ext_pending))
+        app.add_handler(CommandHandler("ext_history", self._cmd_ext_history))
+        # Fall-through: non-slash messages → role-based freeform (exchange / APPROVE)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
 
     async def _reply(self, update: Update, text: str) -> None:
         await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._reply(update, _HELP_TEXT)
+        # Role-aware help (Spec v5 §12.4). Unconfigured deployments / the default
+        # OP chat see the OP view.
+        role = self._role_for_update(update) or "OP"
+        await self._reply(update, _HELP_BY_ROLE.get(role, _OP_HELP))
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pending = self.op_backlog.list_pending()
@@ -376,6 +458,9 @@ class TelegramBot:
 
     async def _handle_disposition(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                   disposition: str) -> None:
+        # Scope decisions are OP's (Spec v5 §12.4).
+        if not await self._authorize(update, {"OP"}):
+            return
         if not ctx.args:
             await self._reply(update, f"Usage: `/{disposition} <ARTIFACT-ID> [text]`")
             return
@@ -429,6 +514,9 @@ class TelegramBot:
         )
 
     async def _cmd_sys(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        # Governance (SYS audits) is Admin OP's (Spec v5 §12.4).
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
         instruction = " ".join(ctx.args).strip() or None
         await self._reply(update, "Triggering SYS audit…")
         result = await self.sys_trigger(instruction)
@@ -500,6 +588,8 @@ class TelegramBot:
         await self._reply(update, f"*Thinking — {artifact_id}*\n\n{text}")
 
     async def _cmd_pause(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
         if not ctx.args:
             await self._reply(update, "Usage: `/pause <CODE>`")
             return
@@ -507,6 +597,8 @@ class TelegramBot:
         await self._reply(update, f"Paused {ctx.args[0].upper()}")
 
     async def _cmd_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
         if not ctx.args:
             await self._reply(update, "Usage: `/resume <CODE>`")
             return
@@ -514,6 +606,8 @@ class TelegramBot:
         await self._reply(update, f"Resumed {ctx.args[0].upper()}")
 
     async def _cmd_rotate(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
         if not ctx.args:
             await self._reply(update, "Usage: `/rotate <CODE>`")
             return
@@ -522,6 +616,8 @@ class TelegramBot:
         await self._reply(update, f"{code} rotated → {new_id}")
 
     async def _cmd_retry(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
         if not ctx.args:
             await self._reply(update, "Usage: `/retry <CODE>`")
             return
@@ -529,6 +625,8 @@ class TelegramBot:
         await self._reply(update, "Retry queued.")
 
     async def _cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
         if len(ctx.args) < 2:
             await self._reply(update, "Usage: `/model <CODE> <model-string>`")
             return
@@ -544,74 +642,190 @@ class TelegramBot:
             lines.append(f"• {code}: {assignments.get(code, '—')}")
         await self._reply(update, "\n".join(lines))
 
-    async def _cmd_build_relay(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = " ".join(ctx.args).strip()
-        if not msg:
-            await self._reply(update, "Usage: `/build <msg>`")
-            return
-        if self.router is None:
-            await self._reply(update, "Router not wired — cannot relay.")
-            return
-        from models import Artifact as A  # local
-        # Spec §9 — proper sequence id for EXT BRQ artifacts.
-        artifact_id = await self.sequences.next_id("EXT", "BRQ")
-        artifact = A(type="BRQ", sender="EXT", content=msg, recipient="BR",
-                     id=artifact_id)
-        # Spec §6.1 — BRQ from EXT opens the build_results cycle.
-        self.cycles.check_cycle_events(artifact, recipients=["BR"])
-        # Route: archives + routing_log + delivers to BR inbox.
-        await self.router.route(artifact)
-        await self._reply(update, f"📥 {artifact_id} relayed to BR.")
+    # ─── DE / EXT direct roles (Spec v5 §12.4-§12.6) ─────────────────────────
+    # /build and /expert OP-relay commands are REMOVED. DE and EXT are first-class
+    # roles that talk to SG / BR directly through their own role-scoped channels.
 
-    async def _cmd_expert_relay(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Spec v4 §12.4 — OP relays Domain Expert response to SG via router.
-
-        Was: direct inbox.deliver bypass that never reached the archive or
-        routing_log, leaving DE_IN artifacts off the audit trail and using
-        a non-spec id format (`DE-IN-<epoch>`). Now mints a proper
-        DE_IN-DE-NNN id via SequenceManager and routes through router so the
-        artifact appears in routing_log + archive like every other artifact.
-        Also fires cycle-event detection so the DE Q&A cycle (Spec v4 §6.1)
-        closes when DE_IN arrives.
-        """
-        msg = " ".join(ctx.args).strip()
-        if not msg:
-            await self._reply(update, "Usage: `/expert <msg>`")
-            return
-        if self.router is None:
-            await self._reply(update, "Router not wired — cannot relay.")
-            return
-        from models import Artifact as A
+    async def _emit_de_in(self, content: str, references=None) -> str:
+        """Mint DE_IN-DE-NNN and route to SG (archive + routing_log). Shared by
+        the DE Telegram handlers and testable directly."""
         artifact_id = await self.sequences.next_id("DE", "DE_IN")
-        artifact = A(type="DE_IN", sender="DE", content=msg, recipient="SG",
-                     id=artifact_id)
-        # DE Q&A cycle closes on DE_IN (Spec v4 §6.1).
+        artifact = Artifact(type="DE_IN", sender="DE", content=content,
+                            recipient="SG", id=artifact_id, references=references or [])
         self.cycles.check_cycle_events(artifact, recipients=["SG"])
         await self.router.route(artifact)
-        await self._reply(update, f"📥 {artifact_id} relayed to SG.")
+        return artifact_id
+
+    async def _emit_brq(self, content: str) -> str:
+        """Mint BRQ-EXT-NNN and route to BR (archive + routing_log)."""
+        artifact_id = await self.sequences.next_id("EXT", "BRQ")
+        artifact = Artifact(type="BRQ", sender="EXT", content=content,
+                            recipient="BR", id=artifact_id)
+        self.cycles.check_cycle_events(artifact, recipients=["BR"])
+        await self.router.route(artifact)
+        return artifact_id
+
+    async def _cmd_de_respond(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"DE"}):
+            return
+        if len(ctx.args) < 2:
+            await self._reply(update, "Usage: `/de_respond <DE_OUT-ID> <response>`")
+            return
+        ref, response = ctx.args[0], " ".join(ctx.args[1:]).strip()
+        de_id = await self._emit_de_in(response, references=[ref])
+        await self._reply(update, f"✅ {de_id} sent to SG.")
+
+    async def _cmd_de_observe(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"DE"}):
+            return
+        msg = " ".join(ctx.args).strip()
+        if not msg:
+            await self._reply(update, "Usage: `/de_observe <observation>`")
+            return
+        de_id = await self._emit_de_in(msg)
+        await self._reply(update, f"📝 Observation {de_id} sent to SG.")
+
+    async def _cmd_de_pending(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"DE"}):
+            return
+        cycles = self.cycles.get_pending_for_role("DE")
+        await self._reply(update, "*DE pending*\n" +
+                          ("\n".join(f"• {c.id}" for c in cycles) or "none"))
+
+    async def _cmd_de_history(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"DE"}):
+            return
+        hist = self.cycles.get_history_for_role("DE")
+        await self._reply(update, "*DE history*\n" +
+                          ("\n".join(f"• {c.get('id')}" for c in hist) or "none"))
+
+    async def _cmd_ext_submit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"EXT"}):
+            return
+        msg = " ".join(ctx.args).strip()
+        if not msg:
+            await self._reply(update, "Usage: `/ext_submit <results>`")
+            return
+        brq_id = await self._emit_brq(msg)
+        await self._reply(update, f"✅ {brq_id} submitted to BR.")
+
+    async def _cmd_ext_ask(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"EXT"}):
+            return
+        msg = " ".join(ctx.args).strip()
+        if not msg:
+            await self._reply(update, "Usage: `/ext_ask <question>`")
+            return
+        brq_id = await self._emit_brq(msg)
+        await self._reply(update, f"❓ {brq_id} sent to BR.")
+
+    async def _cmd_ext_pending(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"EXT"}):
+            return
+        cycles = self.cycles.get_pending_for_role("EXT")
+        await self._reply(update, "*EXT pending*\n" +
+                          ("\n".join(f"• {c.id}" for c in cycles) or "none"))
+
+    async def _cmd_ext_history(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"EXT"}):
+            return
+        hist = self.cycles.get_history_for_role("EXT")
+        await self._reply(update, "*EXT history*\n" +
+                          ("\n".join(f"• {c.get('id')}" for c in hist) or "none"))
+
+    # ─── Admin OP role management (Spec v5 §10.2 + §12.4) ─────────────────────
+
+    async def _cmd_role(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """`/role assign|modify|revoke ...` — 2FA-gated (Spec §13.4)."""
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
+        if self.role_manager is None or not ctx.args:
+            await self._reply(update,
+                "Usage: `/role assign <name> <telegram_id> <role> [project]` | "
+                "`/role revoke <role> [name]` | `/role modify <role> <key=value>...`")
+            return
+        sub = ctx.args[0].lower()
+        chat_id = update.effective_chat.id
+        if sub == "assign" and len(ctx.args) >= 4:
+            name, tg, role = ctx.args[1], ctx.args[2], ctx.args[3].upper()
+            project = " ".join(ctx.args[4:]).strip()
+            otp = self.role_manager.initiate_assign(chat_id, name, tg, role, project)
+            await self._reply(update,
+                f"⚠️ Assign {role} to {name}. Reply `APPROVE` to confirm here, "
+                f"or use code {otp} via MCP. Expires in 5 minutes.")
+        elif sub == "revoke" and len(ctx.args) >= 2:
+            role = ctx.args[1].upper()
+            otp = self.role_manager.initiate_revoke(chat_id, role,
+                                                    " ".join(ctx.args[2:]).strip())
+            await self._reply(update,
+                f"⚠️ Revoke {role}. Reply `APPROVE` or use code {otp}.")
+        elif sub == "modify" and len(ctx.args) >= 3:
+            role = ctx.args[1].upper()
+            changes = {}
+            for tok in ctx.args[2:]:
+                if "=" in tok:
+                    k, _, v = tok.partition("=")
+                    changes[k.strip()] = v.strip()
+            otp = self.role_manager.initiate_modify(chat_id, role, changes)
+            await self._reply(update,
+                f"⚠️ Modify {role}: {changes}. Reply `APPROVE` or use code {otp}.")
+        else:
+            await self._reply(update, "Usage: `/role assign|modify|revoke ...`")
+
+    async def _cmd_roles(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
+        if self.role_manager is None:
+            await self._reply(update, "Role manager not configured.")
+            return
+        summary = self.role_manager.roles_summary()
+        lines = ["*Role assignments*"]
+        for role, data in summary.items():
+            lines.append(f"• {role}: {data.get('name', '?')} "
+                         f"(tg {data.get('telegram_id', '?')})")
+        await self._reply(update, "\n".join(lines) if summary else "No roles assigned.")
+
+    async def _cmd_config_notify(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
+        if len(ctx.args) < 3:
+            await self._reply(update, "Usage: `/config_notify <role> <channel> <mode>`")
+            return
+        role, channel, mode = ctx.args[0], ctx.args[1], ctx.args[2]
+        path = Path(getattr(self.config, "NOTIFICATIONS_FILE",
+                            self.state_dir / "notifications.json"))
+        prefs = load_json(path, default={})
+        prefs.setdefault(role, {})[channel] = mode
+        from state_manager import atomic_write
+        atomic_write(path, json.dumps(prefs, indent=2))
+        await self._reply(update, f"🔔 {role}.{channel} → {mode}")
 
     async def _cmd_resolve(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Spec v4 §6.1 + §12.2 — close an active GOV exchange.
+        """Spec v5 §6.1 + §10.1 + §12.4 — Admin OP closes an active GOV exchange.
 
         Usage: /resolve <GOV-ID> [action-description]
 
-        Records the resolution in OP backlog (moves GOV from pending →
-        resolved with the action note) and closes the gov_exchange cycle so
-        the conversation history stops growing.
+        Records the resolution in the Admin backlog (moves GOV from pending →
+        resolved with the action note) and closes the gov_exchange cycle so the
+        conversation history stops growing.
         """
+        # Governance closure is Admin OP's (Spec v5 §12.4).
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
         if not ctx.args:
             await self._reply(update, "Usage: `/resolve <GOV-ID> [action]`")
             return
         gov_id = ctx.args[0]
         action = " ".join(ctx.args[1:]).strip() or "acknowledged"
-        path = self.op_backlog.find(gov_id)
-        if not path:
+        # GOV lives in the Admin backlog now (Spec v5 §10.1); fall back to OP
+        # backlog for older single-queue deployments.
+        backlog = self.admin_backlog or self.op_backlog
+        if backlog.find(gov_id) is None:
             await self._reply(update, f"No backlog item for {gov_id}")
             return
-        # Move GOV to resolved with the action note (op_backlog.resolve handles
-        # pending→resolved + appends the resolution text per Spec v5 §10.1 / P1-1).
-        self.op_backlog.resolve(gov_id, resolution=action)
-        # Close the gov_exchange cycle opened on this GOV (Spec v4 §6.1).
+        # Move GOV to resolved + append the action note (Spec v5 §10.1 / P1-1).
+        backlog.resolve(gov_id, resolution=action)
+        # Close the gov_exchange cycle opened on this GOV (Spec v5 §6.1).
         self.cycles.close_by_artifact(gov_id)
         await self._reply(
             update,
@@ -619,8 +833,10 @@ class TelegramBot:
         )
 
     async def _cmd_request(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Spec v4 §12.2 + §2.1 S13 — OP submits ad-hoc scope work to SG as
+        """Spec v5 §12.2 + §2.1 S13 — OP submits ad-hoc scope work to SG as
         REQ-OP-NNN. Routes through router for archive + routing_log."""
+        if not await self._authorize(update, {"OP"}):
+            return
         msg = " ".join(ctx.args).strip()
         if not msg:
             await self._reply(update,
@@ -684,13 +900,18 @@ class TelegramBot:
         """
         section = " ".join(ctx.args).strip()
         framework_dir = Path(self.config.FRAMEWORK_DIR)
-        # Prefer v5; fall back to v4 for older deployments.
-        framework_path = framework_dir / "VEGA_Architecture_Framework_v5.md"
-        if not framework_path.exists():
-            framework_path = framework_dir / "VEGA_Architecture_Framework_v4.md"
-        if not framework_path.exists():
+        # Prefer v6, then v5, then v4 (Spec v5 §14 / audit #12).
+        framework_path = None
+        for name in ("VEGA_Architecture_Framework_v6.md",
+                     "VEGA_Architecture_Framework_v5.md",
+                     "VEGA_Architecture_Framework_v4.md"):
+            candidate = framework_dir / name
+            if candidate.exists():
+                framework_path = candidate
+                break
+        if framework_path is None:
             await self._reply(update,
-                f"Framework not found in `{framework_dir}` (looked for v5/v4).")
+                f"Framework not found in `{framework_dir}` (looked for v6/v5/v4).")
             return
         text = framework_path.read_text()
 
@@ -720,41 +941,72 @@ class TelegramBot:
             lines.append(f"• {path.stem}")
         await self._reply(update, "\n".join(lines))
 
-    # ─── Free-text → SG exchange ─────────────────────────────────────────────
+    # ─── Free-text → role-based freeform (Spec v5 §10.2) ─────────────────────
 
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Spec v5 §6.4 + §10.2 — multi-turn OP↔SG PROP exchange, cycle-internal.
-
-        Free-text from OP during an active PROP exchange is NOT a standalone
-        artifact (audit P1-2; Spec §6.4: "Exchange turns within a cycle are NOT
-        standalone artifacts. They are turns in the cycle's messages array.").
-        The turn is appended to the prop_exchange cycle and SG is flagged for
-        execution — no PROP-OP-NNN is minted and nothing is routed. SG's reply
-        rides back to OP via the main loop's exchange relay.
+        """Role-dispatched freeform text (Spec v5 §10.2):
+          OP        → cycle-internal PROP exchange with SG
+          ADMIN_OP  → 2FA `APPROVE`, else cycle-internal GOV exchange with SYS
+          DE/EXT    → hint (they use their slash commands)
+          unknown   → access-not-configured
         """
-        # Engage the in-progress exchange; first freeform message on a pending
-        # item starts the exchange (Spec §10.2).
-        current = self.op_backlog.get_in_progress()
+        role = self._role_for_update(update)
+        if role is None:
+            await self._reply(update,
+                "Access not configured. Use MCP to request access via "
+                "`vega_request_access()`.")
+            return
+        text = update.message.text or ""
+
+        # Admin OP: confirm a pending 2FA role action with "APPROVE".
+        if role == "ADMIN_OP" and text.strip().upper() == "APPROVE":
+            chat_id = update.effective_chat.id
+            if self.role_manager is not None and self.role_manager.has_pending_action(chat_id):
+                ok = await self.role_manager.confirm_pending(chat_id)
+                await self._reply(update,
+                    "✅ Role action confirmed." if ok else "⛔ No valid pending action.")
+            else:
+                await self._reply(update, "No pending role action to approve.")
+            return
+
+        if role == "ADMIN_OP":
+            await self._forward_exchange(update, text, backlog=self.admin_backlog,
+                                         partner="SYS", role="ADMIN_OP")
+            return
+        if role == "OP":
+            await self._forward_exchange(update, text, backlog=self.op_backlog,
+                                         partner="SG", role="OP")
+            return
+        # DE / EXT use structured commands, not freeform.
+        await self._reply(update,
+            "Use your role commands (e.g. /de_respond, /ext_submit). /help for the list.")
+
+    async def _forward_exchange(self, update: Update, text: str, backlog,
+                                partner: str, role: str) -> None:
+        """Cycle-internal exchange turn (Spec §6.4 / audit P1-2): append to the
+        active cycle and flag the partner agent — no artifact, nothing routed.
+        Used for OP↔SG (PROP) and Admin OP↔SYS (GOV) dialogues."""
+        if backlog is None:
+            await self._reply(update, "No backlog configured for this exchange.")
+            return
+        current = backlog.get_in_progress()
         if not current:
-            pending = self.op_backlog.list_pending()
+            pending = backlog.list_pending()
             if pending:
                 current = pending[0]
-                self.op_backlog.start_exchange(current.id)
+                backlog.start_exchange(current.id)
         if not current:
             await self._reply(update,
-                "No active exchange. Use /pending to see queue, /help for commands."
-            )
+                "No active exchange. Use /backlog to see the queue, /help for commands.")
             return
-        cycle = self.cycles.get_active_cycle("SG", current)
+        cycle = self.cycles.get_active_cycle(partner, current)
         if not cycle:
             await self._reply(update,
-                f"No active cycle for {current.id} — cannot forward freeform text."
-            )
+                f"No active cycle for {current.id} — cannot forward freeform text.")
             return
-        text = update.message.text
-        self.cycles.append_turn(cycle, text, "OP")
-        flag_for_execution(self.state_dir, "SG", cycle.id)
-        await self._reply(update, "↩️ Forwarded to SG.")
+        self.cycles.append_turn(cycle, text, role)
+        flag_for_execution(self.state_dir, partner, cycle.id)
+        await self._reply(update, f"↩️ Forwarded to {partner}.")
 
     # ─── Thinking lookup ─────────────────────────────────────────────────────
 
@@ -800,42 +1052,70 @@ AGENT_DESCRIPTIONS = {
     "SYS": "System Auditor — governance quality, cross-agent knowledge propagation",
 }
 
-_HELP_TEXT = """*VEGA OP commands*
-
-*Status*
+_READ_HELP = """*Monitoring*
 `/status` — system overview
-`/backlog` — pending PROP / GOV items
-`/pending` — active PROP exchanges
-`/agent <CODE>` — agent details
-`/agents` — list all agents
+`/backlog` — pending decision items
+`/agent <CODE>` / `/agents` — agent details / list
 `/history <ID>` — routing history for an artifact
 `/cycles` — active conversation cycles
-
-*Audit & governance*
-`/sys [instruction]` — trigger SYS audit
-`/wiki <CODE>` — wiki summary
-`/log <CODE> [N]` — last N log entries
-`/thinking <ID>` — thinking blocks for an artifact
-
-*Agent control*
-`/pause <CODE>` / `/resume <CODE>`
-`/rotate <CODE>` — new instance ID
-`/retry <CODE>` — re-execute
-`/model <CODE> <model>` / `/models`
-
-*Exchanges*
-`/approve <ID>` / `/reject <ID> <reason>` / `/modify <ID> <instructions>`
-
-*External*
-`/build <msg>` — forward to BR
-`/expert <msg>` — forward to SG (Domain Expert response)
-`/request <msg>` — submit ad-hoc scope request to SG (REQ-OP-NNN)
-`/resolve <GOV-ID> [action]` — close active GOV exchange with SYS
+`/wiki <CODE>` · `/log <CODE> [N]` · `/thinking <ID>`
 
 *Reference*
-`/routing <TYPE>` — where a type routes
-`/decisions [prefix]` — decision counters
-`/framework <§>` — framework section reference
+`/routing <TYPE>` · `/decisions [prefix]` · `/framework <§>`"""
 
-Type a plain message during an active PROP exchange to continue the dialogue with SG.
-"""
+_OP_HELP = """*VEGA — OP (scope decisions)*
+
+*Scope decisions*
+`/approve <ID>` / `/reject <ID> <reason>` / `/modify <ID> <instructions>`
+`/request <msg>` — ad-hoc scope request to SG (REQ-OP-NNN)
+`/pending` — active PROP exchanges
+
+*Cross-channel (read-only)*
+`/de_activity` · `/ext_activity`
+
+""" + _READ_HELP + """
+
+Type a plain message during an active PROP exchange to continue with SG."""
+
+_ADMIN_OP_HELP = """*VEGA — Admin OP (governance + administration)*
+
+*Governance*
+`/sys [instruction]` — trigger SYS audit
+`/resolve <GOV-ID> [action]` — close active GOV exchange with SYS
+
+*Role management* (2FA — reply `APPROVE` to confirm)
+`/role assign <name> <tg> <role> [project]`
+`/role modify <role> <key=value>...` · `/role revoke <role> [name]`
+`/roles` — list assignments
+`/config_notify <role> <channel> <mode>`
+
+*Agent control*
+`/pause <CODE>` / `/resume <CODE>` · `/rotate <CODE>` · `/retry <CODE>`
+`/model <CODE> <model>` / `/models`
+
+""" + _READ_HELP + """
+
+Type a plain message during an active GOV exchange to continue with SYS."""
+
+_DE_HELP = """*VEGA — Domain Expert*
+
+`/de_respond <DE_OUT-ID> <response>` — answer SG's question
+`/de_observe <observation>` — initiate a domain observation to SG
+`/de_pending` — outstanding DE_OUT awaiting your response
+`/de_history` — your DE↔SG exchange history"""
+
+_EXT_HELP = """*VEGA — External Build*
+
+`/ext_submit <results>` — submit build/test results to BR
+`/ext_ask <question>` — ask BR a question
+`/ext_pending` — outstanding items awaiting your response
+`/ext_history` — your BR↔EXT exchange history"""
+
+_HELP_BY_ROLE = {
+    "OP": _OP_HELP, "ADMIN_OP": _ADMIN_OP_HELP,
+    "DE": _DE_HELP, "EXT": _EXT_HELP,
+}
+
+# Back-compat: a plain module-level help string (the OP view) for any caller or
+# test that imports _HELP_TEXT directly.
+_HELP_TEXT = _OP_HELP

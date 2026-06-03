@@ -23,7 +23,7 @@ import pytest
 from artifact_store import ArtifactStore
 from cycle_manager import CycleManager
 from models import Artifact, LogEntry, WikiUpdate
-from op_backlog import OPBacklog
+from backlog import OPBacklog
 from router import Router
 from sequence_manager import SequenceManager
 from state_manager import load_json
@@ -206,7 +206,7 @@ async def test_handle_unknown_notify_failure_doesnt_block_archival(tmp_path):
     prevent the offending artifact from being archived + logged."""
 
     class _BoomBot:
-        async def notify(self, artifact):
+        async def notify(self, artifact, role=None):
             raise RuntimeError("simulated telegram outage")
 
     router, store, backlog, cycles, state_dir = _make_router_with_cycles(tmp_path)

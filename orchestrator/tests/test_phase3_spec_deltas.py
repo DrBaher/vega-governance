@@ -17,7 +17,7 @@ from artifact_store import ArtifactStore
 from cycle_manager import CycleManager
 from framework_parser import AGENT_TIER, TIER_SECTIONS, load_framework_view
 from models import Artifact
-from op_backlog import OPBacklog
+from backlog import OPBacklog
 from router import EXTERNAL_TARGETS, OP_BOUND_TYPES, ROUTING_TABLE, Router
 from sequence_manager import SequenceManager
 from state_manager import load_json
@@ -328,40 +328,43 @@ def test_agent_tier_assignments():
     assert AGENT_TIER["TE"] == "minimal"
 
 
-# ─── 2.6 — MCP bearer-token enforcement ──────────────────────────────────────
+# ─── 2.6 — MCP legacy single-token back-compat ───────────────────────────────
+#
+# Role-scoped auth lives in test_phase2_role_migration.py. These two cover the
+# legacy MCP_AUTH_TOKEN fallback (no RoleManager wired): the single token
+# authenticates as OP; no token is the lobby.
 
 @pytest.mark.asyncio
-async def test_mcp_rejects_without_token(tmp_path):
+async def test_mcp_legacy_token_is_op(tmp_path):
     aiohttp_client = pytest.importorskip("aiohttp.test_utils")
     from aiohttp import web
     from mcp_server import MCPServer
 
     class _Cfg:
         MCP_AUTH_TOKEN = "secret-abc"
-        MCP_HOST = "127.0.0.1"
-        MCP_PORT = 0
-        AGENTS = ["SG"]
-        AGENTS_DIR = str(tmp_path)
 
-    srv = MCPServer(config=_Cfg(), tools=None)
+    srv = MCPServer(config=_Cfg(), tools=None)   # no role_manager → legacy mode
     app = web.Application()
     app.router.add_get("/health", srv._health)
     app.router.add_get("/mcp/tools", srv._list_tools)
     app.router.add_post("/mcp/call", srv._call_tool)
     async with aiohttp_client.TestClient(aiohttp_client.TestServer(app)) as client:
-        # No token → 401
+        # No token → lobby (200, only the request-access tool, Spec §12.1).
         r = await client.get("/mcp/tools")
-        assert r.status == 401
-        # Wrong token → 401
-        r = await client.get("/mcp/tools",
-                              headers={"Authorization": "Bearer nope"})
-        assert r.status == 401
-        # Correct token → 200
-        r = await client.get("/mcp/tools",
-                              headers={"Authorization": "Bearer secret-abc"})
         assert r.status == 200
         body = await r.json()
-        assert "tools" in body and len(body["tools"]) >= 15
+        assert [t["name"] for t in body["tools"]] == ["vega_request_access"]
+        # Invalid token → 401
+        r = await client.get("/mcp/tools",
+                             headers={"Authorization": "Bearer nope"})
+        assert r.status == 401
+        # Legacy token → OP toolset
+        r = await client.get("/mcp/tools",
+                             headers={"Authorization": "Bearer secret-abc"})
+        assert r.status == 200
+        body = await r.json()
+        names = [t["name"] for t in body["tools"]]
+        assert "vega_approve" in names and "vega_sys" not in names
         # Health is unauthenticated
         r = await client.get("/health")
         assert r.status == 200
@@ -394,7 +397,7 @@ async def test_notify_failure_doesnt_block_archival(tmp_path):
     notify must not prevent the artifact from being archived + logged."""
 
     class _BoomBot:
-        async def notify(self, artifact):
+        async def notify(self, artifact, role=None):
             raise RuntimeError("simulated telegram outage")
         async def notify_external_relay(self, artifact, target):
             raise RuntimeError("simulated telegram outage")

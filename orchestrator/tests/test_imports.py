@@ -14,7 +14,7 @@ def test_all_modules_import():
     import wiki_manager            # noqa: F401
     import router                  # noqa: F401
     import cycle_manager           # noqa: F401
-    import op_backlog              # noqa: F401
+    import backlog                 # noqa: F401
     import executor                # noqa: F401
     # telegram_bot pulls in python-telegram-bot (might be absent at test time)
     try:

@@ -220,7 +220,7 @@ async def test_handle_unknown_works_without_telegram_bot(tmp_path):
     """The auto-GOV path must not crash when the bot is None — e.g., a CLI
     smoke run or test harness without a real Telegram setup."""
     from artifact_store import ArtifactStore
-    from op_backlog import OPBacklog
+    from backlog import OPBacklog
 
     state_dir = tmp_path / "state"; state_dir.mkdir()
     agents_dir = tmp_path / "agents"

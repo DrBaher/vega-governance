@@ -21,9 +21,20 @@ FRAMEWORK_DIR = str(BASE_DIR / "framework")
 ARTIFACTS_DIR = str(BASE_DIR / "artifacts" / "archive")
 CYCLES_DIR = str(BASE_DIR / "cycles" / "active")
 OP_BACKLOG_DIR = str(BASE_DIR / "op_backlog")
+ADMIN_BACKLOG_DIR = str(BASE_DIR / "admin_backlog")   # Spec v5 §2 — GOV + role requests
 STATE_DIR = str(BASE_DIR / "state")
 TEST_MODELS_FULL_DIR = str(BASE_DIR / "test_models" / "full")
 TEST_MODELS_BUILD_DIR = str(BASE_DIR / "test_models" / "build")
+
+# ─── Role-based access (Framework v6 §13, Spec v5 §10.4) ─────────────────────
+CONFIG_DIR = str(BASE_DIR / "config")
+ROLES_FILE = str(BASE_DIR / "config" / "roles.json")          # hashed tokens + telegram IDs
+RECOVERY_FILE = str(BASE_DIR / "config" / "recovery.hash")    # break-glass key (hashed)
+INVITES_DIR = str(BASE_DIR / "config" / "invites")            # pending invite codes
+NOTIFICATIONS_FILE = str(BASE_DIR / "config" / "notifications.json")  # per-role prefs
+ROLE_EVENTS_FILE = str(BASE_DIR / "state" / "role_events.jsonl")      # append-only audit trail
+INVITE_EXPIRY = 24 * 60 * 60   # 24 hours
+OTP_EXPIRY = 5 * 60            # 5 minutes
 
 # ─── Agents ──────────────────────────────────────────────────────────────────
 AGENTS = ["SG", "SA", "SE", "TG", "TA", "TE", "BR", "BTA", "SYS"]
@@ -84,3 +95,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # ─── Telegram ────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_OP_CHAT_ID = os.environ.get("TELEGRAM_OP_CHAT_ID", "")
+
+# ─── MCP server (Spec v5 §12.1-12.3) ─────────────────────────────────────────
+# Role-scoped HTTP endpoint. Token determines which tools are visible.
+MCP_ENABLED = True
+MCP_PORT = 8420

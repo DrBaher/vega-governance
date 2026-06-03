@@ -36,6 +36,31 @@ from state_manager import LOCKS, atomic_save_json, load_json
 from wiki_manager import WikiManager
 
 
+# ─── Framework document version chains (Spec v5 §14, audit #12) ──────────────
+# Newest first; the loader uses the first file that exists. v6 framework + v5
+# spec are the v0.3.0 source of truth; older filenames are kept for back-compat
+# with deployments that haven't synced yet.
+FRAMEWORK_FILENAMES = (
+    "VEGA_Architecture_Framework_v6.md",
+    "VEGA_Architecture_Framework_v5.md",
+    "VEGA_Architecture_Framework_v4.md",
+)
+SPEC_FILENAMES = (
+    "VEGA_Orchestrator_Technical_Spec_v5.md",
+    "VEGA_Orchestrator_Technical_Spec_v4.md",
+    "VEGA_Orchestrator_Technical_Spec_v3.md",
+)
+MANIFESTO_FILENAMES = ("VEGA_Manifesto_v4.md",)
+
+
+def _first_existing(framework_dir, names) -> "Path | None":
+    for name in names:
+        path = framework_dir / name
+        if path.exists():
+            return path
+    return None
+
+
 # ─── Response parsing ────────────────────────────────────────────────────────
 
 # Block headers expected in agent output per Spec §5.3.
@@ -808,13 +833,14 @@ class AgentExecutor:
         if framework_dir is None or not framework_dir.exists():
             return ""
 
-        # Read v5 if present; if only v4 is around, fall back to legacy
-        # full-framework loader so we don't ship an empty context.
-        v5_path = framework_dir / "VEGA_Architecture_Framework_v5.md"
-        if not v5_path.exists():
+        # Prefer v6, then v5, then v4 (Spec v5 §14 / audit #12). If only the
+        # legacy v4 is around, fall back to the full-framework loader so we don't
+        # ship an empty context.
+        framework_path = _first_existing(framework_dir, FRAMEWORK_FILENAMES)
+        if framework_path is None or framework_path.name.endswith("_v4.md"):
             return self._load_framework()
 
-        framework_text = v5_path.read_text()
+        framework_text = framework_path.read_text()
 
         # Manifesto and spec are useful at all tiers above minimal — attach
         # them after the section extracts so guardians see the full project
@@ -835,18 +861,15 @@ class AgentExecutor:
         # appending only one would leave SYS blind to the spec.
         extras: list[str] = [view]
 
-        manifesto_path = framework_dir / "VEGA_Manifesto_v4.md"
-        if manifesto_path.exists():
-            extras.append(f"## VEGA_Manifesto_v4.md\n" +
+        manifesto_path = _first_existing(framework_dir, MANIFESTO_FILENAMES)
+        if manifesto_path is not None:
+            extras.append(f"## {manifesto_path.name}\n" +
                           manifesto_path.read_text())
 
-        # Prefer spec v4; fall back to v3 for older deployments.
-        for name in ("VEGA_Orchestrator_Technical_Spec_v4.md",
-                     "VEGA_Orchestrator_Technical_Spec_v3.md"):
-            path = framework_dir / name
-            if path.exists():
-                extras.append(f"## {name}\n" + path.read_text())
-                break   # one spec version is enough
+        # Prefer spec v5; fall back to v4/v3 for older deployments.
+        spec_path = _first_existing(framework_dir, SPEC_FILENAMES)
+        if spec_path is not None:
+            extras.append(f"## {spec_path.name}\n" + spec_path.read_text())
         return "\n\n".join(extras)
 
     def _load_framework(self) -> str:
@@ -863,14 +886,12 @@ class AgentExecutor:
             return ""
         chunks = []
         # Prefer the newest published versions; fall back to older filenames
-        # for back-compat with deployments that haven't synced framework v5 /
-        # spec v4 yet. First match per slot wins. Stable order = cache-friendly.
+        # for back-compat with deployments that haven't synced framework v6 /
+        # spec v5 yet. First match per slot wins. Stable order = cache-friendly.
         for filename_options in [
-            ("VEGA_Architecture_Framework_v5.md",
-             "VEGA_Architecture_Framework_v4.md"),
-            ("VEGA_Manifesto_v4.md",),
-            ("VEGA_Orchestrator_Technical_Spec_v4.md",
-             "VEGA_Orchestrator_Technical_Spec_v3.md"),
+            FRAMEWORK_FILENAMES,
+            MANIFESTO_FILENAMES,
+            SPEC_FILENAMES,
             ("VEGA_CORTEX_Addon_Specification_v0.2_BETA.md",),
         ]:
             for name in filename_options:

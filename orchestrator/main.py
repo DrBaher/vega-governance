@@ -29,7 +29,8 @@ from cycle_manager import CycleManager
 from executor import AgentExecutor
 from framework_parser import compose_system_prompt
 from models import Artifact, utcnow_iso
-from op_backlog import OPBacklog
+from backlog import Backlog
+from role_manager import RoleManager
 from router import Router
 from sequence_manager import (
     InstanceManager, ModelAssignmentManager, SequenceManager,
@@ -43,6 +44,17 @@ from wiki_manager import WikiManager
 
 
 # ─── Globals managed by the loop ─────────────────────────────────────────────
+
+def _cfg_path(config, attr: str, *default_parts: str) -> str:
+    """Read a path from config, deriving a BASE_DIR-relative default when the
+    attribute is absent — so deployments whose config.py predates the v6/v5
+    role-access keys (admin_backlog, config/, role_events) still work."""
+    value = getattr(config, attr, None)
+    if value:
+        return str(value)
+    base = Path(getattr(config, "BASE_DIR", "."))
+    return str(base.joinpath(*default_parts))
+
 
 class Orchestrator:
 
@@ -73,7 +85,18 @@ class Orchestrator:
             replace_threshold_default=config.WIKI_REPLACE_THRESHOLD_DEFAULT,
             replace_thresholds=config.WIKI_REPLACE_THRESHOLDS,
         )
-        self.op_backlog = OPBacklog(config.OP_BACKLOG_DIR)
+        # Spec v5 §10.1 — two decision queues: OP (PROP) and Admin OP (GOV).
+        self.op_backlog = Backlog(config.OP_BACKLOG_DIR)
+        self.admin_backlog = Backlog(_cfg_path(config, "ADMIN_BACKLOG_DIR", "admin_backlog"))
+        # Spec v5 §10.4 — role manager (tokens, 2FA, invites, audit trail).
+        self.role_manager = RoleManager(
+            roles_file=_cfg_path(config, "ROLES_FILE", "config", "roles.json"),
+            invites_dir=_cfg_path(config, "INVITES_DIR", "config", "invites"),
+            events_file=_cfg_path(config, "ROLE_EVENTS_FILE", "state", "role_events.jsonl"),
+            recovery_file=_cfg_path(config, "RECOVERY_FILE", "config", "recovery.hash"),
+            invite_expiry=getattr(config, "INVITE_EXPIRY", 24 * 60 * 60),
+            otp_expiry=getattr(config, "OTP_EXPIRY", 5 * 60),
+        )
         # CORTEX placeholder — stub methods raise NotImplementedError. Never
         # invoked while CORTEX_ENABLED=False (the default). Activating CORTEX
         # requires filling in cortex_script.py per CORTEX spec §6–§17.
@@ -109,10 +132,18 @@ class Orchestrator:
             agent_resume=self._resume_agent,
             state_dir=config.STATE_DIR,
         )
+        # Wire role-based access into the bot (Spec v5 §10.2/§12.4) and let the
+        # role manager push invites/OTPs to a person's Telegram via the bot.
+        self.bot.role_manager = self.role_manager
+        self.bot.admin_backlog = self.admin_backlog
+        self.role_manager._notify = (
+            lambda chat_id, text: self.bot.send(text, chat_id=chat_id)
+        )
         self.router = Router(
             store=self.store,
             state_dir=config.STATE_DIR,
             op_backlog=self.op_backlog,
+            admin_backlog=self.admin_backlog,   # Spec v5 §4.2 — GOV → Admin OP
             telegram_bot=self.bot,
             cycles=self.cycles,   # audit NEW-1 — stamp routing_log with cycle_id
         )
@@ -176,8 +207,12 @@ class Orchestrator:
                     process_disposition=self.bot.process_disposition,
                     state_dir=config.STATE_DIR,
                     router=self.router,
+                    admin_backlog=self.admin_backlog,     # Spec v5 §10.1
+                    role_manager=self.role_manager,       # Spec v5 §12.3
+                    telegram_bot=self.bot,
                 )
-                mcp_server = MCPServer(config=config, tools=tools)
+                mcp_server = MCPServer(config=config, tools=tools,
+                                       role_manager=self.role_manager)
                 await mcp_server.start()
             except Exception as e:
                 print(f"[main] MCP server failed to start: "
@@ -445,8 +480,18 @@ def initialize_project(initial_input_path: str | None = None) -> None:
     for code in config.AGENTS:
         for sub in ("wiki", "inbox", "outbox"):
             (Path(config.AGENTS_DIR) / code / sub).mkdir(parents=True, exist_ok=True)
-    for sub in ("pending", "in_progress", "resolved"):
-        (Path(config.OP_BACKLOG_DIR) / sub).mkdir(parents=True, exist_ok=True)
+    # Decision backlogs — OP (PROP) and Admin OP (GOV + role requests) (§10.1).
+    admin_backlog_dir = _cfg_path(config, "ADMIN_BACKLOG_DIR", "admin_backlog")
+    for backlog_dir in (config.OP_BACKLOG_DIR, admin_backlog_dir):
+        for sub in ("pending", "in_progress", "resolved"):
+            (Path(backlog_dir) / sub).mkdir(parents=True, exist_ok=True)
+    # Role-based access scaffolding (Spec v5 §2, §10.4).
+    Path(_cfg_path(config, "CONFIG_DIR", "config")).mkdir(parents=True, exist_ok=True)
+    Path(_cfg_path(config, "INVITES_DIR", "config", "invites")).mkdir(
+        parents=True, exist_ok=True)
+    role_events = Path(_cfg_path(config, "ROLE_EVENTS_FILE", "state", "role_events.jsonl"))
+    role_events.parent.mkdir(parents=True, exist_ok=True)
+    role_events.touch(exist_ok=True)   # append-only audit trail (SYS reads, §5.9)
 
     # Step 2 — extract system prompts from framework (Spec §14 step 2 + §5.3)
     _generate_system_prompts()

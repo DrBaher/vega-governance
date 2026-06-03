@@ -22,7 +22,7 @@ import pytest
 from artifact_store import ArtifactStore
 from cycle_manager import CycleManager
 from models import Artifact
-from op_backlog import OPBacklog
+from backlog import OPBacklog
 from router import ROUTING_TABLE, Router
 from sequence_manager import SequenceManager
 from state_manager import load_json

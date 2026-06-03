@@ -6,7 +6,7 @@ Every (sender, type) interaction in the Framework must have a routing entry.
 
 import pytest
 
-from router import ROUTING_TABLE, OP_BOUND_TYPES, EXTERNAL_TARGETS
+from router import ROUTING_TABLE, OP_BOUND_TYPES, ADMIN_BOUND_TYPES, EXTERNAL_TARGETS
 
 
 # Expected agent-to-agent interactions from Framework §2.
@@ -45,8 +45,8 @@ EXPECTED_ROUTES = [
     ("BR", "BRP", None, ["EXT"]),
     ("EXT", "BRQ", None, ["BR"]),
     ("SG", "DE_OUT", None, ["DE"]),
-    # SYS (§2.7)
-    ("SYS", "GOV", None, ["OP"]),
+    # SYS (§2.7) — GOV is governance → Admin OP (Spec v5 §4.1)
+    ("SYS", "GOV", None, ["ADMIN_OP"]),
     # AUTH from OP (§7.2 + §13 step 4)
     ("OP",  "AUTH", None, ["SG"]),
 ]
@@ -56,8 +56,8 @@ EXPECTED_ROUTES = [
 def test_routing_table_covers_framework_interactions(sender, doc_type, ref_type, recipients):
     """Every framework interaction must have a routing entry with the right recipients."""
     if doc_type == "GOV" and sender == "SYS":
-        # GOV is OP-bound
-        assert ("SYS", "GOV") in OP_BOUND_TYPES
+        # GOV is Admin-OP-bound (Spec v5 §4.2)
+        assert ("SYS", "GOV") in ADMIN_BOUND_TYPES
         return
     if ref_type:
         key = (sender, doc_type, ref_type)
@@ -73,8 +73,13 @@ def test_prop_is_op_bound():
     assert OP_BOUND_TYPES[("SG", "PROP")]["exchange_mode"] is True
 
 
-def test_gov_is_op_bound():
-    assert ("SYS", "GOV") in OP_BOUND_TYPES
+def test_gov_is_admin_bound():
+    # Spec v5 §4.2 — GOV (governance) goes to the Admin OP backlog, with a
+    # SYS↔Admin OP exchange mode. It is NOT OP-bound anymore.
+    assert ("SYS", "GOV") in ADMIN_BOUND_TYPES
+    assert ("SYS", "GOV") not in OP_BOUND_TYPES
+    assert ADMIN_BOUND_TYPES[("SYS", "GOV")]["notify_role"] == "ADMIN_OP"
+    assert ADMIN_BOUND_TYPES[("SYS", "GOV")]["exchange_partner"] == "SYS"
 
 
 def test_external_targets_recognized():

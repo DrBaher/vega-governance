@@ -1,10 +1,10 @@
 """
-OP backlog — pending / in_progress / resolved.
+Backlog — pending / in_progress / resolved.
 
-PROP and GOV artifacts wait here for OP. Each artifact lives as a file; the directory
+Spec v5 §10.1: ONE generic Backlog class, instantiated twice — `op_backlog`
+(PROP items for OP, scope decisions) and `admin_backlog` (GOV items + role
+requests for Admin OP, governance). Each artifact lives as a file; the directory
 it's in encodes the state. AUTH is constructed by the bot when OP responds.
-
-Per Spec §10.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from models import Artifact, utcnow_iso
 from state_manager import atomic_append, atomic_write
 
 
-class OPBacklog:
+class Backlog:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -89,6 +89,11 @@ class OPBacklog:
             if p.exists():
                 return p
         return None
+
+
+# Back-compat alias — the class was `OPBacklog` before the v5 rename to a generic
+# two-instance Backlog (Spec §10.1). Kept so older imports keep working.
+OPBacklog = Backlog
 
 
 def make_auth(prop_id: str, disposition: str, reason: str = "",
