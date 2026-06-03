@@ -242,6 +242,31 @@ async def test_mcp_role_scoped_tool_visibility(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_mcp_legacy_token_works_with_role_manager_present(tmp_path):
+    """Back-compat: a single-operator deployment's MCP_AUTH_TOKEN still resolves
+    to OP even when a RoleManager is wired but no roles are assigned yet."""
+    aiohttp_client = pytest.importorskip("aiohttp.test_utils")
+    from aiohttp import web
+    from mcp_server import MCPServer
+
+    rm = _make_role_manager(tmp_path)   # no roles assigned
+    cfg = types.SimpleNamespace(MCP_AUTH_TOKEN="legacy-tok")
+    srv = MCPServer(config=cfg, tools=None, role_manager=rm)
+    app = web.Application()
+    app.router.add_get("/mcp/tools", srv._list_tools)
+    async with aiohttp_client.TestClient(aiohttp_client.TestServer(app)) as client:
+        r = await client.get("/mcp/tools",
+                             headers={"Authorization": "Bearer legacy-tok"})
+        assert r.status == 200
+        names = [t["name"] for t in (await r.json())["tools"]]
+        assert "vega_approve" in names   # OP toolset
+        # A non-matching token is still rejected.
+        r = await client.get("/mcp/tools",
+                             headers={"Authorization": "Bearer nope"})
+        assert r.status == 401
+
+
+@pytest.mark.asyncio
 async def test_mcp_pending_invite_sees_only_activate(tmp_path):
     aiohttp_client = pytest.importorskip("aiohttp.test_utils")
     from aiohttp import web

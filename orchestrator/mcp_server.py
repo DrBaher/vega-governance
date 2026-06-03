@@ -543,8 +543,10 @@ class MCPServer:
             invite = self.role_manager.activate_invite(token)
             if invite:
                 return {"role": "_PENDING", "invite_code": token, "invite": invite}
-            raise self._Unauthorized()
-        # Legacy single-token mode.
+        # Legacy single-token fallback — keeps an existing single-operator
+        # deployment working as OP until real roles are assigned (mirrors the
+        # Telegram unconfigured-superuser back-compat). Once role tokens exist
+        # they take precedence; the legacy token still resolves to OP.
         legacy = getattr(self.config, "MCP_AUTH_TOKEN", "") or ""
         if legacy and token == legacy:
             return {"role": "OP"}
