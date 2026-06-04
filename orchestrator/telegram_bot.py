@@ -202,23 +202,29 @@ class TelegramBot:
         # Target the role's chat when role routing is configured; else default.
         await self.send(msg, role=target if target in ("DE", "EXT") else None)
 
+    # Which decision role owns the human side of an agent's exchange cycle:
+    # SG↔OP (prop_exchange) → OP; SYS↔Admin OP (gov_exchange) → ADMIN_OP.
+    _EXCHANGE_PARTNER_ROLE = {"SG": "OP", "SYS": "ADMIN_OP"}
+
     async def relay_exchange_reply(self, agent_code: str, cycle_id: str,
                                    text: str) -> None:
-        """Relay a partner agent's cycle-internal exchange reply to OP (Spec §6.4).
+        """Relay a partner agent's cycle-internal exchange reply to the human role
+        that owns the exchange (Spec §6.4): SG→OP, SYS→Admin OP.
 
         The reply is a conversational turn (no artifact), so it doesn't flow
-        through notify(); we surface it directly. If the same turn also produced
-        a formal artifact (e.g. SG closes the exchange with an AUTH), that rides
-        the normal routing + notification path on the next tick."""
+        through notify(); we surface it directly to the right role's chat. If the
+        same turn also produced a formal artifact (e.g. SG closes with an AUTH),
+        that rides the normal routing + notification path on the next tick."""
+        role = self._EXCHANGE_PARTNER_ROLE.get(agent_code)
         msg = (
             f"💬 *{agent_code} response* (cycle {cycle_id})\n\n"
             f"{text}\n\n"
             f"Reply to continue, or `/approve` / `/reject` / `/modify`."
         )
-        await self.send(msg)
+        await self.send(msg, role=role)
 
     async def handle_sg_exchange_response(self, artifact: Artifact) -> None:
-        """During PROP exchange: SG response should round-trip to OP via Telegram."""
+        """During PROP exchange: SG's response round-trips to the OP role's chat."""
         thinking = self._latest_thinking(artifact)
         thinking_section = f"\n💭 _SG thinking:_ {thinking}\n" if thinking else ""
         msg = (
@@ -227,7 +233,7 @@ class TelegramBot:
             f"{thinking_section}\n"
             f"Reply to continue, or `/approve` / `/reject` / `/modify`."
         )
-        await self.send(msg)
+        await self.send(msg, role="OP")
 
     # ─── Role resolution + authorization (Spec v5 §10.2/§12.4) ───────────────
 
