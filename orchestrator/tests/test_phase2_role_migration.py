@@ -301,6 +301,38 @@ def test_cycle_activity_and_pending(tmp_path):
     assert any(c.id == cycle.id for c in pending)
 
 
+def test_scope_scoping_fits_small_window_and_keeps_full_for_large(tmp_path):
+    """Per-agent scope scoping: a 200k-window agent gets a manifest + budget-bounded
+    docs (relevant first); a 1M-window agent gets the whole corpus."""
+    import types as _t
+    from executor import AgentExecutor
+    scope_dir = tmp_path / "scope"; scope_dir.mkdir()
+    (scope_dir / "big_audit.md").write_text("# Audit archive\n" + "x" * 1_400_000)
+    (scope_dir / "primary_scope.md").write_text("# Primary scope\n" + "p" * 40_000)
+    (scope_dir / "open_items.md").write_text("# Open items\n" + "o" * 20_000)
+
+    ex = object.__new__(AgentExecutor)
+    ex.scope_dir = scope_dir
+    ex.config = _t.SimpleNamespace(SCOPE_BUDGET_FRACTION=0.5)
+
+    # SE on a 200k window (haiku) — full corpus (~1.46M chars) can't fit.
+    ex.models = _t.SimpleNamespace(get=lambda c: "claude-haiku-4-5")
+    items = [Artifact(type="SCN", sender="SG", id="SCN-SG-1",
+                      content="apply change to primary_scope.md")]
+    se_scope = ex._load_scope("SE", items)
+    assert "SCOPE MANIFEST" in se_scope
+    assert "[loaded] primary_scope.md" in se_scope        # relevant → loaded
+    assert "[omitted] big_audit.md" in se_scope            # huge → omitted
+    assert "x" * 1000 not in se_scope                      # the 1.4MB audit body is NOT inlined
+    assert len(se_scope) < 400_000                         # bounded
+
+    # SG on a 1M window (opus) — whole corpus loads, no manifest gating.
+    ex.models = _t.SimpleNamespace(get=lambda c: "claude-opus-4-7")
+    sg_scope = ex._load_scope("SG", items)
+    assert "SCOPE MANIFEST" not in sg_scope
+    assert "x" * 1000 in sg_scope                          # full audit body present
+
+
 def test_executor_resolves_referenced_archive_artifacts(tmp_path):
     """An inbox item's referenced archived artifacts are pulled into context
     (the archive-access gap fix) — scoped to the referenced ids, not the whole

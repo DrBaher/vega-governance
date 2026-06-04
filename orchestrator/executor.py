@@ -62,6 +62,37 @@ MANIFESTO_FILENAMES = ("VEGA_Manifesto_v4.md",)
 REF_ARTIFACT_MAX_CHARS = 24_000     # per referenced artifact
 REF_TOTAL_MAX_CHARS = 96_000        # across all references in one execution
 
+# Per-agent scope scoping — the scope corpus can exceed a model's context window
+# (loading the whole thing into every agent is the dominant token cost and breaks
+# 200k-window models). Agents whose window comfortably holds the full corpus get
+# it all; smaller-window agents get a manifest of the full set plus the relevant /
+# smallest docs that fit a budget.
+SCOPE_BUDGET_FRACTION_DEFAULT = 0.5   # fraction of the model window allotted to scope
+SCOPE_CHARS_PER_TOKEN = 3.5           # conservative (real ~4-6) → under-fill, never overflow
+
+
+def _first_heading(text: str) -> str:
+    for line in text.splitlines():
+        s = line.strip().lstrip("#").strip()
+        if s:
+            return s[:80]
+    return ""
+
+
+def _scope_mentions(items, names) -> set:
+    """Scope doc names (or their filename stems) referenced by the agent's inbox
+    items' content/references — these are loaded first as the relevant ones."""
+    if not items:
+        return set()
+    hay = " ".join(((getattr(i, "content", "") or "") + " "
+                    + " ".join(getattr(i, "references", None) or [])) for i in items)
+    out = set()
+    for n in names:
+        stem = n.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if n in hay or (stem and stem in hay):
+            out.add(n)
+    return out
+
 
 def _first_existing(framework_dir, names) -> "Path | None":
     for name in names:
@@ -176,7 +207,7 @@ class AgentExecutor:
                     "error": "missing_system_prompt", "message": str(e)}
         wiki_content, entries_included = self.wiki.read_all(agent_code)
         universal = self.wiki.read_universal(agent_code)
-        scope = self._load_scope(agent_code)
+        scope = self._load_scope(agent_code, items)
         # Framework v5 §12 + Spec v4 §5.3 — tiered context per role.
         # Minimal tier (SE/TE) receives only their system prompt; the full
         # framework would risk over-reasoning about governance instead of
@@ -855,21 +886,58 @@ class AgentExecutor:
             )
         return path.read_text()
 
-    def _load_scope(self, agent_code: str) -> str:
+    def _load_scope(self, agent_code: str, items=None) -> str:
         # Agents with scope read access per Spec §3.2
         SCOPE_READERS = {"SG", "SA", "SE", "TG", "TA", "BR", "SYS"}
-        if agent_code not in SCOPE_READERS:
+        if agent_code not in SCOPE_READERS or not self.scope_dir.exists():
             return ""
-        if not self.scope_dir.exists():
-            return ""
-        chunks = []
+        docs: list[tuple[str, str, int]] = []
         for path in sorted(self.scope_dir.glob("**/*")):
             if path.is_file() and path.suffix in {".md", ".txt"}:
                 try:
-                    chunks.append(f"## {path.relative_to(self.scope_dir)}\n{path.read_text()}")
+                    text = path.read_text()
                 except Exception:
                     continue
-        return "\n\n".join(chunks)
+                docs.append((str(path.relative_to(self.scope_dir)), text, len(text)))
+        if not docs:
+            return ""
+
+        total = sum(sz for _, _, sz in docs)
+        # Budget = a fraction of this agent's model window, reserving the rest for
+        # system prompt + wiki + framework + inbox + references + output.
+        limit = _model_context_limit(self.models.get(agent_code))
+        fraction = getattr(self.config, "SCOPE_BUDGET_FRACTION",
+                           SCOPE_BUDGET_FRACTION_DEFAULT)
+        budget = int(limit * fraction * SCOPE_CHARS_PER_TOKEN)
+        if total <= budget:
+            # Fits comfortably (e.g. guardians on a 1M window) — load the lot.
+            return "\n\n".join(f"## {n}\n{t}" for n, t, _ in docs)
+
+        # Per-agent scoping (B): relevant docs first, then smallest-first to fit;
+        # always prepend a manifest of the FULL corpus so the agent knows what
+        # exists and can flag if it needs an omitted doc.
+        mentioned = _scope_mentions(items, [n for n, _, _ in docs])
+        order = ([d for d in docs if d[0] in mentioned]
+                 + sorted((d for d in docs if d[0] not in mentioned),
+                          key=lambda d: d[2]))
+        selected: list[tuple[str, str]] = []
+        used = 0
+        for n, t, sz in order:
+            if used + sz > budget:
+                continue
+            selected.append((n, t))
+            used += sz
+        loaded = {n for n, _ in selected}
+        manifest = (
+            "## SCOPE MANIFEST — full corpus catalogue. [loaded] docs appear below "
+            "in full; [omitted] are available — ask OP to inject one (or it's "
+            "loaded when an artifact you receive references it) if you need it.\n"
+            + "\n".join(
+                f"- {'[loaded]' if n in loaded else '[omitted]'} {n} "
+                f"(~{sz // 1000}k chars) — {_first_heading(t)}"
+                for n, t, sz in docs))
+        body = "\n\n".join(f"## {n}\n{t}" for n, t in selected)
+        return manifest + "\n\n" + body
 
     def _load_framework_view(self, agent_code: str) -> str:
         """Framework v5 §12 + Spec v4 §5.3 — return the tiered view for this
