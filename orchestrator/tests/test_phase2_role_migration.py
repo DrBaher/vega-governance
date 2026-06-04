@@ -326,6 +326,23 @@ def test_executor_resolves_referenced_archive_artifacts(tmp_path):
     assert ex._format_referenced_artifacts([prop]) == ""
 
 
+@pytest.mark.asyncio
+async def test_vega_about_gives_role_glossary_to_every_role(tmp_path):
+    """vega_about returns the authoritative agent/human role glossary + project,
+    and is visible to every authenticated role (so clients don't confabulate)."""
+    from mcp_server import ROLE_TOOLS, AGENT_ROLES
+    tools, _ = _make_mcptools(tmp_path)
+    about = await tools.vega_about(role_info={"role": "DE"})
+    assert about["your_role"] == "DE"
+    assert "Scope Editor" in about["agent_roles"]["SE"]       # not "scale/source"
+    assert set(("OP", "ADMIN_OP", "DE", "EXT")) <= set(about["human_roles"])
+    # Available to all four authenticated roles.
+    for role in ("OP", "ADMIN_OP", "DE", "EXT"):
+        assert "vega_about" in ROLE_TOOLS[role]
+    # ...but not the lobby.
+    assert "vega_about" not in ROLE_TOOLS[None]
+
+
 def test_framework_chain_prefers_v6(tmp_path):
     from executor import _first_existing, FRAMEWORK_FILENAMES
     fw = tmp_path / "framework"; fw.mkdir()

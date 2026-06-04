@@ -38,6 +38,27 @@ from state_manager import flag_for_execution, load_json
 from wiki_manager import WikiManager
 
 
+# Canonical role glossary (Framework §2/§5) — authoritative baseline so a
+# mediating client doesn't confabulate role meanings (vega_about / §12.1).
+AGENT_ROLES = {
+    "SG":  "Scope Guardian — owns scope; analyses inputs, drafts PROPs for OP, issues SCN to SE.",
+    "SA":  "Scope Auditor — audits scope artifacts, raises FND to SG.",
+    "SE":  "Scope Editor — mechanically edits scope documents per SG's SCN (NOT 'scale/source').",
+    "TG":  "Tests Guardian — owns the test model; drafts TCN, issues to TE.",
+    "TA":  "Tests Auditor — audits test artifacts, raises FND to TG.",
+    "TE":  "Tests Editor — mechanically edits test models per TG's TCN.",
+    "BR":  "Build Rep — engineering/build authority; liaises with EXT; raises DEV on scope impact.",
+    "BTA": "Build Test Auditor — audits build/test results, raises TFR/VR.",
+    "SYS": "System Auditor — meta-governance; audits the whole system, raises GOV.",
+}
+HUMAN_ROLES = {
+    "OP":       "Operator — owns scope decisions; approves/rejects/modifies SG's PROPs.",
+    "ADMIN_OP": "Admin Operator — governance, role management, agent control.",
+    "DE":       "Domain Expert — answers SG's domain questions (DE_OUT → DE_IN).",
+    "EXT":      "External Build — submits build/test results and questions to BR.",
+}
+
+
 # ─── Tool implementations ────────────────────────────────────────────────────
 
 class MCPTools:
@@ -84,6 +105,32 @@ class MCPTools:
         self.process_disposition = process_disposition
         self.state_dir = Path(state_dir)
         self.router = router
+
+    # ─── Orientation ────────────────────────────────────────────────────────
+
+    async def vega_about(self, role_info: dict | None = None) -> dict[str, Any]:
+        """Baseline context for a mediating client (Spec §12.1): the project name,
+        a short project summary, the agent + human role glossary, and the caller's
+        own role. Available to every authenticated role so no one has to guess
+        what SG/SE/etc. mean."""
+        summary = ""
+        summary_file = getattr(self.config, "PROJECT_SUMMARY_FILE", None)
+        if not summary_file:
+            base = getattr(self.config, "BASE_DIR", None)
+            if base:
+                cand = Path(base) / "PROJECT_SUMMARY.md"
+                summary_file = str(cand) if cand.exists() else None
+        if summary_file and Path(summary_file).exists():
+            summary = Path(summary_file).read_text()[:4000]
+        return {
+            "project": getattr(self.config, "PROJECT_NAME", "VEGA deployment"),
+            "summary": summary,
+            "your_role": (role_info or {}).get("role"),
+            "agent_roles": AGENT_ROLES,
+            "human_roles": HUMAN_ROLES,
+            "note": "Agents are stateless governance roles; the immutable archive "
+                    "(artifacts/archive/) is authoritative over any working memory.",
+        }
 
     # ─── Status & monitoring ────────────────────────────────────────────────
 
@@ -399,6 +446,8 @@ class MCPTools:
 # ─── Tool registry — MCP tool name → method name + JSON schema ──────────────
 
 TOOL_REGISTRY: dict[str, dict[str, Any]] = {
+    # Orientation (all roles)
+    "vega_about":    {"method": "vega_about",    "params": {}},
     # Monitoring / read-only
     "vega_status":   {"method": "vega_status",   "params": {}},
     "vega_backlog":  {"method": "vega_backlog",  "params": {}},
@@ -470,12 +519,14 @@ ROLE_TOOLS: dict[str | None, list[str]] = {
     None: ["vega_request_access"],
     "_PENDING": ["vega_activate_role"],
     "OP": [
+        "vega_about",
         "vega_approve", "vega_reject", "vega_modify", "vega_request",
         "vega_exchange", "vega_backlog", "vega_status", "vega_agent",
         "vega_cycles", "vega_history", "vega_thinking", "vega_wiki",
         "vega_log", "vega_de_activity", "vega_ext_activity",
     ],
     "ADMIN_OP": [
+        "vega_about",
         "vega_sys", "vega_resolve", "vega_exchange",
         "vega_assign_role", "vega_modify_role", "vega_revoke_role",
         "vega_roles", "vega_activate_role",
@@ -484,13 +535,13 @@ ROLE_TOOLS: dict[str | None, list[str]] = {
         "vega_status", "vega_backlog", "vega_agent", "vega_cycles",
         "vega_history", "vega_thinking", "vega_wiki", "vega_log",
     ],
-    "DE": ["vega_de_respond", "vega_de_observe", "vega_de_history", "vega_de_pending"],
-    "EXT": ["vega_ext_submit", "vega_ext_ask", "vega_ext_history", "vega_ext_pending"],
+    "DE": ["vega_about", "vega_de_respond", "vega_de_observe", "vega_de_history", "vega_de_pending"],
+    "EXT": ["vega_about", "vega_ext_submit", "vega_ext_ask", "vega_ext_history", "vega_ext_pending"],
 }
 
 # Tools whose behaviour depends on the caller's role (they take role_info).
 ROLE_AWARE_TOOLS = {
-    "vega_exchange", "vega_backlog", "vega_assign_role",
+    "vega_about", "vega_exchange", "vega_backlog", "vega_assign_role",
     "vega_modify_role", "vega_revoke_role",
 }
 
