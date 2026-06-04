@@ -52,6 +52,16 @@ SPEC_FILENAMES = (
 )
 MANIFESTO_FILENAMES = ("VEGA_Manifesto_v4.md",)
 
+# Reference resolution (Spec §5 — agents act on artifacts they can't otherwise
+# see). Agents' per-call context is inbox + wiki + UNIVERSAL + framework + scope —
+# NOT the immutable archive. So when an inbox item (an AUTH, REJ, VR, …) only
+# *references* an archived artifact, the agent can't read the thing it's supposed
+# to act on. We resolve those references and include the bodies — scoped to the
+# referenced ids only (never the whole archive), and bounded so they can't blow
+# the context window.
+REF_ARTIFACT_MAX_CHARS = 24_000     # per referenced artifact
+REF_TOTAL_MAX_CHARS = 96_000        # across all references in one execution
+
 
 def _first_existing(framework_dir, names) -> "Path | None":
     for name in names:
@@ -180,6 +190,12 @@ class AgentExecutor:
             framework=framework,
         )
         dynamic_content = self._format_inbox(items)
+        # Resolve archived artifacts the inbox items reference, so the agent can
+        # read what it's acting on (e.g. an AUTH's PROP) — the archive isn't in
+        # the per-call grounding otherwise.
+        referenced = self._format_referenced_artifacts(items)
+        if referenced:
+            dynamic_content = dynamic_content + "\n\n" + referenced
 
         if cycle:
             messages = self._build_cycle_messages(cycle, static_content, dynamic_content)
@@ -682,6 +698,46 @@ class AgentExecutor:
         for a in items:
             chunks.append(f"--- INCOMING: {a.id} ({a.type} from {a.sender}) ---\n{a.to_markdown()}")
         return "\n\n".join(chunks)
+
+    def _format_referenced_artifacts(self, items: list[Artifact]) -> str:
+        """Resolve the `references` of inbox items from the immutable archive and
+        return their bodies as read-only context (Spec §5 / archive-access gap).
+
+        Scoped to the directly-referenced ids only (no recursion, no whole-archive
+        load) and bounded by REF_*_MAX_CHARS so a large/ many references can't
+        blow the context window. Self-references and ids already in the inbox are
+        skipped (the agent already has those bodies)."""
+        inbox_ids = {a.id for a in items if a.id}
+        seen: set[str] = set()
+        chunks: list[str] = []
+        total = 0
+        truncated_any = False
+        for item in items:
+            for rid in (item.references or []):
+                if not rid or rid in seen or rid in inbox_ids:
+                    continue
+                seen.add(rid)
+                art = self.store.archive.load(rid)
+                if art is None:
+                    continue   # referent not in archive (external ref, e.g. a doc §)
+                body = art.to_markdown()
+                if len(body) > REF_ARTIFACT_MAX_CHARS:
+                    body = body[:REF_ARTIFACT_MAX_CHARS] + "\n…(referenced artifact truncated)"
+                    truncated_any = True
+                if total + len(body) > REF_TOTAL_MAX_CHARS:
+                    chunks.append(f"--- REFERENCED: {rid} — omitted (reference budget "
+                                  f"exhausted; read it from artifacts/archive/{rid}.md) ---")
+                    truncated_any = True
+                    continue
+                total += len(body)
+                chunks.append(f"--- REFERENCED: {rid} "
+                              f"({art.type} from {art.sender}) ---\n{body}")
+        if not chunks:
+            return ""
+        note = (" (some truncated — full bodies in artifacts/archive/)"
+                if truncated_any else "")
+        return ("# REFERENCED ARTIFACTS — read-only, resolved from the immutable "
+                f"archive for the items above{note}\n\n" + "\n\n".join(chunks))
 
     def _format_sys_inbox(
         self, all_wikis: dict[str, str], all_logs: dict[str, str],

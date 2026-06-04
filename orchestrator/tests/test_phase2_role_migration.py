@@ -301,6 +301,31 @@ def test_cycle_activity_and_pending(tmp_path):
     assert any(c.id == cycle.id for c in pending)
 
 
+def test_executor_resolves_referenced_archive_artifacts(tmp_path):
+    """An inbox item's referenced archived artifacts are pulled into context
+    (the archive-access gap fix) — scoped to the referenced ids, not the whole
+    archive, and self/inbox references are skipped."""
+    from executor import AgentExecutor
+    router, store, _, _, _, _ = _make_router(tmp_path)
+    # Seed the archive with a PROP that an AUTH will reference.
+    prop = Artifact(type="PROP", sender="SG", content="the proposal body to act on",
+                    id="PROP-SG-042")
+    store.archive_artifact(prop)
+    auth = Artifact(type="AUTH", sender="OP", content="approve",
+                    references=["PROP-SG-042", "PROP-SG-042", "Open Chantiers §C1"],
+                    id="AUTH-OP-042")
+
+    ex = object.__new__(AgentExecutor)
+    ex.store = store
+    out = ex._format_referenced_artifacts([auth])
+    assert "REFERENCED: PROP-SG-042" in out
+    assert "the proposal body to act on" in out
+    assert out.count("REFERENCED: PROP-SG-042") == 1   # deduped
+    assert "Open Chantiers" not in out                 # non-archived ref skipped silently
+    # An item referencing only itself / inbox-present ids yields nothing.
+    assert ex._format_referenced_artifacts([prop]) == ""
+
+
 def test_framework_chain_prefers_v6(tmp_path):
     from executor import _first_existing, FRAMEWORK_FILENAMES
     fw = tmp_path / "framework"; fw.mkdir()
