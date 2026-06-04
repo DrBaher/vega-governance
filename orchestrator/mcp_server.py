@@ -177,9 +177,21 @@ class MCPTools:
     async def vega_cycles(self) -> list[str]:
         return sorted(p.stem for p in self.cycles.active_dir.glob("*.json"))
 
-    async def vega_history(self, artifact_id: str) -> list[dict[str, Any]]:
+    async def vega_history(self, artifact_id: str) -> dict[str, Any]:
+        """Open an artifact: its full body from the immutable archive (Spec §7.4)
+        PLUS its routing history (§17.2). Previously returned only the routing_log
+        records, so OP couldn't read artifact content — the truncation suffix's
+        promise of "full content via /history" was unmet (Spec §10.2)."""
+        archive_path = Path(self.config.ARTIFACTS_DIR) / f"{artifact_id}.md"
+        content = archive_path.read_text() if archive_path.exists() else None
         log = load_json(self.state_dir / "routing_log.json", default=[])
-        return [e for e in log if e.get("artifact_id") == artifact_id]
+        routing = [e for e in log if e.get("artifact_id") == artifact_id]
+        return {
+            "artifact_id": artifact_id,
+            "found": content is not None,
+            "content": content,      # full artifact markdown (None if not archived)
+            "routing": routing,      # routing_log entries for this id (may be empty)
+        }
 
     # ─── Decision (Spec §11) ────────────────────────────────────────────────
 

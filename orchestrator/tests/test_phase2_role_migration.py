@@ -173,6 +173,24 @@ def _make_mcptools(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_vega_history_returns_artifact_body_and_routing(tmp_path):
+    """vega_history must return the artifact BODY (from the archive) — not just
+    routing_log records — so OP can actually read a PROP/SCN."""
+    tools, root = _make_mcptools(tmp_path)
+    tools.config.ARTIFACTS_DIR = str(root / "artifacts" / "archive")
+    prop = Artifact(type="PROP", sender="SG", content="the full proposal body",
+                    recipient="OP", id="PROP-SG-099")
+    tools.store.archive_artifact(prop)
+    out = await tools.vega_history("PROP-SG-099")
+    assert out["found"] is True
+    assert "the full proposal body" in out["content"]      # body, not metadata
+    assert isinstance(out["routing"], list)                # routing still included
+    # Unknown id → found False, no crash.
+    missing = await tools.vega_history("PROP-SG-404")
+    assert missing["found"] is False and missing["content"] is None
+
+
+@pytest.mark.asyncio
 async def test_de_respond_creates_de_in_to_sg(tmp_path):
     tools, root = _make_mcptools(tmp_path)
     res = await tools.vega_de_respond("DE_OUT-SG-001", "the loinc code is 1234-5")
