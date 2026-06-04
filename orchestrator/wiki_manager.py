@@ -43,9 +43,31 @@ ENTRY_ID_PATTERN = re.compile(
 )
 
 
+# log.md is append-only and can grow without bound (esp. if transient API errors
+# get logged every tick). It's fed into each agent's context via read_all, so an
+# unbounded log snowballs the prompt until it blows the model's context window —
+# a self-reinforcing failure. Cap how much of the tail we load (~12-17k tokens).
+LOG_READ_MAX_CHARS = 40_000
+
+
 def _read(path: Path) -> str:
     with open(path) as f:
         return f.read()
+
+
+def _read_log(path: Path, max_chars: int = LOG_READ_MAX_CHARS) -> str:
+    """Read an agent log, bounded to the most recent ~max_chars. Trims to the
+    first whole entry ('## [' heading) so we never start mid-entry, and prefixes
+    a marker noting older entries were elided (the full file is still on disk)."""
+    content = _read(path)
+    if len(content) <= max_chars:
+        return content
+    tail = content[-max_chars:]
+    cut = tail.find("\n## [")
+    if cut != -1:
+        tail = tail[cut + 1:]
+    return ("[log truncated — older entries elided from context; "
+            "full history in this agent's wiki/log.md on disk]\n\n" + tail)
 
 
 def _extract_entry_ids(content: str) -> list[str]:
@@ -122,7 +144,8 @@ class WikiManager:
         for filename in READ_ORDER:
             path = wiki_dir / filename
             if path.exists():
-                content = _read(path)
+                # Bound log.md so an append-only log can't snowball the prompt.
+                content = _read_log(path) if filename == "log.md" else _read(path)
                 chunks.append(f"## {filename}\n{content}")
                 for eid in _extract_entry_ids(content):
                     if eid not in seen:
@@ -371,10 +394,12 @@ class WikiManager:
         return {code: self.read_all(code)[0] for code in agent_codes}
 
     def read_all_logs(self, agent_codes: list[str]) -> dict[str, str]:
+        # Bounded per-log so a SYS audit (which reads every agent's log) can't be
+        # blown out by one runaway log either.
         result = {}
         for code in agent_codes:
             path = self.agents_dir / code / "wiki" / "log.md"
-            result[code] = path.read_text() if path.exists() else ""
+            result[code] = _read_log(path) if path.exists() else ""
         return result
 
 

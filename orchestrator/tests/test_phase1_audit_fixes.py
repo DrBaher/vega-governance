@@ -99,6 +99,20 @@ def test_universal_replace_is_logged(tmp_path):
     assert "Untouched" in body
 
 
+def test_read_all_bounds_runaway_log(tmp_path):
+    """A huge append-only log.md must NOT be fed wholesale into the agent context
+    (prevents the prompt-too-long snowball). read_all bounds it to a tail."""
+    from wiki_manager import LOG_READ_MAX_CHARS
+    wm, agents, _ = _make_wiki(tmp_path)
+    log = agents / "SG" / "wiki" / "log.md"
+    log.write_text("".join(f"## [2026-06-04 07:{i:02d}] SG | ERROR | boom {i}\n"
+                           for i in range(40000)))
+    content, _ = wm.read_all("SG")
+    assert len(content) < LOG_READ_MAX_CHARS + 5000   # bounded, not the 2 MB on disk
+    assert "log truncated" in content
+    assert log.stat().st_size > 1_000_000             # full file untouched on disk
+
+
 def test_universal_append_is_logged(tmp_path):
     wm, agents, universal = _make_wiki(tmp_path)
     wm.apply_universal_update(WikiUpdate(
