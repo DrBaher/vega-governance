@@ -32,6 +32,8 @@
 17. [Log Integration](#17-log-integration)
 18. [Initialization](#18-initialization)
 19. [Open Questions](#19-open-questions)
+- [Appendix A: cortex_script.py Interface](#appendix-a-cortex_scriptpy-interface)
+- [Appendix B: Two-Phase Approach](#appendix-b-two-phase-approach)
 
 ---
 
@@ -63,6 +65,16 @@ CORTEX has two execution layers:
 
 The agent never sees strengths, heat scores, evidence counts, or decay factors. It sees ranked lists. The richness of the CORTEX model is invisible to the agent and handled entirely by the orchestrator's script pipeline.
 
+### 2.1 Corpus Types
+
+CORTEX indexes two corpus types with the same navigation model:
+
+**Agent wikis (per-agent).** Each `.md` file is one entry. Activated when an agent's wiki exceeds `CORTEX_SCAN_THRESHOLD` entries (~15). This is the primary corpus — learned knowledge from real failures.
+
+**Scope documents (shared, read-only).** Each `##` heading within a scope file is one entry. Activated when the total scope corpus exceeds an agent's context budget (per Orchestrator §5.3). Navigation returns `(document, section, score)` tuples. The executor uses CORTEX rankings to select which scope sections to load within the agent's budget, replacing document-level classification with content-level relevance.
+
+Scope indexing is additive — it doesn't replace the budget-based scope loading from §5.3. When CORTEX is inactive for an agent (below threshold), §5.3 classification-based loading applies. When CORTEX is active, it provides finer-grained section selection within the same budget.
+
 ---
 
 ## 3. Baseline Modifications (when CORTEX is active)
@@ -87,7 +99,7 @@ Add to the wiki schema table:
 **§6 Wiki Update Protocol — "When to LINT" table — add row:**
 
 ```
-| When CORTEX is active: every 10 sessions | Concept health: orphan concepts, overloaded entries (>10 concepts), synonym detection | See CORTEX spec §16 |
+| When CORTEX is active: every 10 executions | Concept health: orphan concepts, overloaded entries (>10 concepts), synonym detection | See CORTEX spec §16 |
 ```
 
 **§6 Per-Agent Wiki Pages table — add to each agent:**
@@ -139,6 +151,32 @@ consultation_record = {
 
 This is more reliable than agent self-reporting: the orchestrator knows exactly which files were in the API call.
 
+**§5.3 Scope Loading — CORTEX-navigated scope (when active):**
+
+When CORTEX is active for an agent AND scope exceeds the agent's context budget, replace document-level loading with section-level CORTEX navigation:
+
+```python
+if CORTEX_ENABLED and scope_exceeds_budget:
+    # CORTEX indexes scope sections (## headings within scope docs)
+    ranked_sections = cortex_script.navigate_scope(
+        agent_code=agent_code,
+        inbox_items=items,
+        budget_chars=scope_budget
+    )
+    # Returns: [(document, section_heading, content, score), ...]
+    # Load top-ranked sections within budget, include manifest of full corpus
+    scope_content = format_ranked_scope_sections(ranked_sections, scope_budget)
+else:
+    # Fallback: §5.3 classification-based loading (spec > management, task-scoped for SE/TE)
+    scope_content = _load_scope_classified(agent_code, items, scope_budget)
+```
+
+The four navigation modes (§8) apply to scope sections identically to wiki entries:
+- **Similarity**: SCN targets §3.9 → §3.9 and related sections rank high
+- **Recency**: Recently modified sections rank higher (post-SCN validation)
+- **Frequency**: High-traffic sections rank higher (commonly referenced areas)
+- **Composition**: Similarity × recency for "what's relevant AND recently changed"
+
 **§14.2 Agent Execution Log — add field:**
 
 ```json
@@ -152,8 +190,8 @@ This is more reliable than agent self-reporting: the orchestrator knows exactly 
 
 ```python
 CORTEX_ENABLED = True  # Set False to run VEGA without CORTEX
-CORTEX_SCRIPT_FREQUENCY = "post_execution"  # or "every_N" or "periodic"
 CORTEX_SCAN_THRESHOLD = 15  # Below this entry count, linear scan. Above, concept navigation.
+CORTEX_SCOPE_INDEXING = True  # Index scope document sections for CORTEX navigation
 ```
 
 **New file in orchestrator/:**
@@ -207,6 +245,7 @@ concept: verification
 type: functional
 strength: 3.2     (composite weight — script-computed)
 evidence: 5        (tasks where this entry was consulted for this concept)
+validation: confirmed  (confirmed | tentative — see §6)
 last_consulted: 2026-05-20
 ```
 
@@ -237,7 +276,7 @@ Concepts are unconstrained — anything can be a concept. But concepts are typed
 > **Execution context:** Orchestrator script (`cortex_script.py`). Agent never sees these numbers.
 
 ```
-strength = importance × validation × (1 + log(evidence + 1)) × recency_factor
+strength = importance × validation × (1 + ln(evidence + 1)) × recency_factor  # ln = natural log
 ```
 
 | Factor | Source | Values | Updateable? |
@@ -382,9 +421,9 @@ When a task outcome is unsatisfactory (REV received, finding rejected, triage ov
 
 > **Execution context:** Orchestrator script (periodic computation).
 
-Links not consulted over N sessions slowly decay via recency_factor:
+Links not consulted over N executions slowly decay via recency_factor:
 
-| Sessions since last consultation | Recency factor |
+| Executions since last consultation | Recency factor |
 |----------------------------------|----------------|
 | 0-5 | 1.0 |
 | 6-10 | 0.85 |
@@ -392,7 +431,7 @@ Links not consulted over N sessions slowly decay via recency_factor:
 | 16-20 | 0.55 |
 | 20+ | 0.5 (floor) |
 
-The floor at 0.5 ensures old knowledge never fully disappears. A rule from session 1 that hasn't been consulted in 30 sessions is still findable — just deprioritized. If reload discovers it, the recency resets to 1.0.
+The floor at 0.5 ensures old knowledge never fully disappears. A rule from the first execution that hasn't been consulted in 30 executions is still findable — just deprioritized. If reload discovers it, the recency resets to 1.0.
 
 ---
 
@@ -471,7 +510,7 @@ Status: normalized
 2. Detects concepts appearing in 3+ agents → candidate for UNIVERSAL
 3. Detects alias patterns → normalizes canonical name
 4. Writes to UNIVERSAL autonomously
-5. If new UNIVERSAL entry contradicts an agent's role/wiki: publish with exclusion tag + GOV-SYS-NNN to OP (per D-ARCH-031 exclusion mechanism)
+5. If new UNIVERSAL entry contradicts an agent's role/wiki: publish with exclusion tag + GOV-SYS-NNN to Admin OP (per D-ARCH-031 exclusion mechanism)
 
 SYS does NOT modify agent-local concept graphs. Each agent's concepts.md is generated from that agent's own data only.
 
@@ -505,10 +544,10 @@ Added to the agent self-lint protocol (framework §6):
 | Overloaded entries (>10 concepts) | Script generates report | Agent reviews: split entry or merge concepts |
 | Synonym detection (>80% overlap) | Script generates report | Agent decides canonical name, script merges |
 | Dead links (entry deleted from wiki) | Script detects automatically | Script removes link, recomputes |
-| Stale concepts (not consulted 20+ sessions) | Script detects via decay | Flagged in lint report — still relevant or prune? |
+| Stale concepts (not consulted 20+ executions) | Script detects via decay | Flagged in lint report — still relevant or prune? |
 | Missing functional (task logged without functional concept) | Script detects from LOG_ENTRY | Flagged — review task decomposition quality |
 
-The script generates a lint report. The agent reviews during scheduled self-lint (every 10 sessions per D-ARCH-022). The agent makes judgment calls (merge vs keep). The script applies the mechanical changes.
+The script generates a lint report. The agent reviews during scheduled self-lint (every 10 executions per D-ARCH-022). The agent makes judgment calls (merge vs keep). The script applies the mechanical changes.
 
 ---
 
@@ -570,6 +609,20 @@ Option A — Cold start: activate CORTEX, start with empty concepts.md, let it g
 Option B — Warm start: the orchestrator script makes a one-time pass through existing log.md files (if they exist) and retroactively builds initial concepts.md from historical consultation patterns. This is a script operation, zero agent cost.
 
 Recommendation: Option B if log.md files have meaningful history. Option A otherwise.
+
+### 18.3 Scope Indexing
+
+When `CORTEX_SCOPE_INDEXING` is enabled, the script indexes scope document sections at:
+- **Initialization**: full index build from all `scope/` files
+- **Post-SE-application**: re-index after SE applies an SCN (scope content has changed)
+- **Post-VAL**: re-index after SG validates the applied changes (confirms the new scope is coherent)
+- **Post-restoration**: re-index after scope is restored to a snapshot (§7.5) — scope content reverted
+
+Note: the §7.5 validated-state snapshot is written at AUTH time (pre-application) and captures the previous validated state for recovery. CORTEX re-indexing happens later, after SE has applied and SG has validated — it captures the new scope content for navigation. These are different events with different purposes; CORTEX re-indexing is decoupled from snapshot success.
+
+The scope index is a flat list of `(document, section_heading, content, concepts)` entries stored in `state/cortex/scope_index.json`. Rebuilt on change, not incrementally maintained — scope changes are infrequent (per approval cycle).
+
+**Cold-start.** Initial scope section concepts are derived from heading text and content keywords via `_extract_concepts_from_text`. These are speculative — the same bootstrap problem that wiki entries solve via `validation: tentative` (§10). Scope section entries carry `validation: tentative` until consultation evidence accumulates from actual agent executions. Navigation quality for scope is unreliable in the first few executions after indexing; the ranking improves as agents consult sections and provide ground-truth evidence.
 
 ---
 
@@ -656,7 +709,107 @@ class CortexScript:
         self._generate_concept_graph(cross_patterns, aliases)
 
         return cross_patterns, aliases
+
+    # --- Scope Document Navigation (§2.1) ---
+
+    def index_scope(self, scope_dir):
+        """Rebuild scope section index. Called when scope changes (post-SCN
+        application) or at initialization.
+        
+        Parses each scope document for ## headings and indexes each section
+        as an entry: (document, section_heading, content, concepts).
+        Initial concepts derived from heading text and content keywords.
+        Subsequent executions refine via consultation evidence (same as wiki)."""
+        sections = []
+        for path in sorted(Path(scope_dir).glob("**/*.md")):
+            doc_name = path.name
+            content = path.read_text()
+            for heading, section_content in self._split_by_headings(content):
+                sections.append({
+                    "document": doc_name,
+                    "section": heading,
+                    "content": section_content,
+                    "concepts": self._extract_concepts_from_text(heading, section_content),
+                })
+        self._save_scope_index(sections)
+
+    def navigate_scope(self, agent_code, inbox_items, budget_chars):
+        """Return scope sections ranked by relevance to the agent's current task.
+        
+        Uses the same navigation modes as wiki (§8): task concepts from inbox
+        items are matched against indexed scope section concepts. Returns
+        sections in ranked order until budget_chars is filled.
+        
+        Returns: list of (document, section_heading, content, score) tuples."""
+        # 1. Extract task concepts from inbox items
+        task_concepts = self._infer_task_concepts(inbox_items)
+
+        # 2. Load scope section index
+        index = self._load_scope_index()
+
+        # 3. Score each section against task concepts (same strength model as wiki)
+        scored = []
+        for entry in index:
+            score = self._compute_relevance(entry["concepts"], task_concepts, agent_code)
+            scored.append((entry["document"], entry["section"], entry["content"], score))
+
+        # 4. Rank by score, fill budget
+        scored.sort(key=lambda x: x[3], reverse=True)
+        result = []
+        used = 0
+        for doc, section, content, score in scored:
+            if used + len(content) > budget_chars:
+                continue
+            result.append((doc, section, content, score))
+            used += len(content)
+
+        return result
+
+    # --- Scope indexing helpers ---
+
+    def _split_by_headings(self, content):
+        """Parse a scope document into (heading, section_content) pairs.
+        Splits on ## boundaries. Returns list of (heading_text, content_str)."""
+        ...
+
+    def _extract_concepts_from_text(self, heading, section_content):
+        """Derive initial concepts from heading text and content keywords.
+        Returns list of concept strings. These are speculative — tagged with
+        validation: tentative until consultation evidence accumulates."""
+        ...
+
+    def _save_scope_index(self, sections):
+        """Persist scope section index to state/cortex/scope_index.json."""
+        ...
+
+    def _load_scope_index(self):
+        """Read scope section index from state/cortex/scope_index.json."""
+        ...
+
+    def _infer_task_concepts(self, inbox_items):
+        """Extract task concepts from inbox items pre-execution.
+        Used for scope navigation (pre-execution inference). Distinct from
+        _extract_task_concepts which reads post-execution LOG_ENTRY."""
+        ...
+
+    def _compute_relevance(self, entry_concepts, task_concepts, agent_code):
+        """Score a scope section (or wiki entry) against task concepts.
+        Uses the same strength model as wiki navigation — concept overlap
+        weighted by strength, heat, and evidence count."""
+        ...
 ```
+
+**Three concept extraction paths.** The CORTEX model now has three methods producing concepts:
+
+| Method | When | Input | Purpose |
+|--------|------|-------|---------|
+| `_extract_task_concepts(log_entries)` | Post-execution | Agent LOG_ENTRY | Ground-truth evidence — updates link strengths |
+| `_infer_task_concepts(inbox_items)` | Pre-execution | Inbox items | Navigation context — selects scope sections to load |
+| `_extract_concepts_from_text(heading, content)` | Index time | Scope section text | Initial speculative tags for new scope sections |
+
+These are intentionally different paths with different reliability levels. `_extract_task_concepts` provides ground truth. `_infer_task_concepts` provides best-effort navigation (pre-execution, no LOG_ENTRY yet). `_extract_concepts_from_text` provides speculative bootstrap tags (no execution context at all). The post-execution evidence from `_extract_task_concepts` refines the speculative tags over time — this is the same convergence pattern as wiki entries.
+
+**Section-level vs file-level granularity.** Scope sections and wiki files are indexed at different granularities (one `##` heading = one scope entry vs one `.md` file = one wiki entry). Consultation tracking, heat distribution, and decay rates may need per-corpus tuning as the system accumulates real usage data. This is operational tuning, not an architectural concern.
 
 ---
 

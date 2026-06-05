@@ -108,7 +108,7 @@ vega/
 ├── framework/
 │   ├── VEGA_Architecture_Framework_v6.md
 │   ├── VEGA_Manifesto_v4.md
-│   └── VEGA_LOINC_Project_Addendum.md   # (project-specific)
+│   └── VEGA_<Project>_Addendum.md        # (project-specific, if present)
 │
 ├── agents/
 │   ├── SG/
@@ -170,7 +170,7 @@ vega/
     ├── execution_log.json
     ├── artifact_index.json       # Artifact ID → execution ID lookup (for /thinking)
     ├── wiki_replace_counters.json # Per-agent replace_section counts since last SYS run
-    └── role_events.jsonl          # Append-only role management audit trail (SYS reads)
+    └── role_events.jsonl          # Append-only operational audit trail — role management + snapshot/restore events (SYS reads)
 ```
 
 ---
@@ -221,6 +221,7 @@ STATE_DIR = f"{BASE_DIR}/state"
 # Telegram
 TELEGRAM_BOT_TOKEN = "..."
 TELEGRAM_OP_CHAT_ID = "..."
+TELEGRAM_EXCHANGE_ENABLED = False  # Freeform exchange disabled — use MCP vega_exchange
 
 # MCP Server
 MCP_ENABLED = True
@@ -256,6 +257,11 @@ WIKI_REPLACE_THRESHOLDS = {
 CORTEX_ENABLED = False
 CORTEX_SCAN_THRESHOLD = 15
 
+# Validated-State Snapshots (§7.5)
+SNAPSHOT_ENABLED = True
+SNAPSHOT_LOCAL_DIR = "/var/vega-snapshots"  # Outside orchestrator tree
+SNAPSHOT_GIT_REMOTE = None                  # Optional — "origin" to push to git
+
 # External Build
 EXT_BUILD_ENABLED = True
 ```
@@ -272,7 +278,7 @@ EXT_BUILD_ENABLED = True
 | TE | own wiki, universal/, inbox/, test_models/full/, test_models/build/ | own wiki, outbox/, test_models/full/, test_models/build/ |
 | BR | own wiki, universal/, scope/, framework/ (summary §12.1), inbox/, test_models/build/ | own wiki, outbox/ |
 | BTA | own wiki, universal/, framework/ (summary §12.1), inbox/, test_models/full/ | own wiki, outbox/ |
-| SYS | ALL wikis (read), universal/, framework/ (SYS view §12.3), artifacts/archive/, ALL log.md, execution_log.json, role_events.jsonl | own wiki, universal/ (write), outbox/ |
+| SYS | ALL wikis (read), universal/, framework/ (SYS view §12.3), artifacts/archive/, ALL log.md, execution_log.json, role_events.jsonl, snapshots/ | own wiki, universal/ (write), outbox/ |
 
 ---
 
@@ -334,48 +340,27 @@ ROUTING_TABLE = {
     # AUTH from OP (§7.2) — archived immutably and delivered to SG
     ("OP", "AUTH"):         [{"to": "SG"}],
 
-    # System Auditor (§2.7)
-    ("SYS", "GOV"):         [{"to": "ADMIN_OP"}],
+    # Backlog-bound routes (non-blocking, delivered to human role backlogs)
+    # Router checks for "backlog" key — if present, routes to backlog + notify.
+    # If absent, delivers to agent inbox. One table, branch on entry shape.
+    ("SG", "PROP"):         [{"to": "OP", "backlog": "op_backlog/pending",
+                              "notify_role": "OP", "exchange_mode": True,
+                              "exchange_partner": "SG"}],
+    ("SYS", "GOV"):         [{"to": "ADMIN_OP", "backlog": "admin_backlog/pending",
+                              "notify_role": "ADMIN_OP", "exchange_mode": True,
+                              "exchange_partner": "SYS"}],
 }
 ```
 
-### 4.2 Backlog-Bound Routes (non-blocking)
-
-```python
-# OP backlog — scope decisions
-OP_BOUND_TYPES = {
-    ("SG", "PROP"): {
-        "queue": "op_backlog/pending",
-        "notify": True,
-        "notify_role": "OP",
-        "priority_field": True,
-        "exchange_mode": True,
-        "exchange_partner": "SG"
-    },
-}
-
-# Admin OP backlog — governance decisions
-ADMIN_BOUND_TYPES = {
-    ("SYS", "GOV"): {
-        "queue": "admin_backlog/pending",
-        "notify": True,
-        "notify_role": "ADMIN_OP",
-        "priority_field": False,
-        "exchange_mode": True,
-        "exchange_partner": "SYS"
-    },
-}
-```
-
-### 4.3 Routing Rules
+### 4.2 Routing Rules
 
 1. When an agent produces an artifact in its outbox, the router picks it up.
 2. Router reads `type`, `sender`, and (for response types) `ref_type` from the artifact metadata.
 3. For each recipient: copies artifact to `agents/{recipient}/inbox/`.
 4. Archives to `artifacts/archive/`. **Archive is immutable — never modified after write.**
 5. Appends to `state/routing_log.json`.
-6. For OP-bound types: copies to `op_backlog/pending/`. Sends Telegram notification (best-effort — see §10.2).
-7. For EXT/DE-bound types: see §12 External Interfaces.
+6. If the routing entry has a `backlog` key: copies to the specified backlog directory, sends Telegram notification to the specified role (best-effort — see §10.2). Does NOT deliver to agent inbox.
+7. If no `backlog` key: delivers to agent inbox (`agents/{recipient}/inbox/`). For EXT/DE-bound types: see §12 External Interfaces.
 8. **Unknown routing key** (type+sender not in table): log as governance violation, auto-create GOV with timestamp-based ID (`GOV-SYS-AUTO-<epoch_ms>`) — the AUTO prefix distinguishes from SYS-minted GOV. Route GOV to Admin OP backlog (`admin_backlog`). Do not deliver artifact. SYS can re-issue with a proper sequence ID during its next audit if needed. Auto-generated GOV artifacts remain in the archive permanently (immutable). When SYS re-issues, the new GOV-SYS-NNN references the auto-GOV in its references field.
 
 ### 4.4 REJ Routing Resolution
@@ -414,19 +399,6 @@ async def check_and_execute(agent_code: str):
     universal_content = wiki_manager.read_universal(agent_code)  # Filters excluded_for per D-ARCH-031
     scope_docs = load_scope_docs(agent_code)
     inbox_items = inbox.get_unprocessed()
-
-    if cycle:
-        # Continue existing cycle — pass full messages array
-        messages = cycle.build_continuation(inbox_items)
-    else:
-        # Fresh execution — single user message
-        messages = build_fresh_messages(
-            wiki=wiki_content,
-            universal=universal_content,
-            inbox=inbox_items,
-            scope=scope_docs,
-            instance_id=get_instance_id(agent_code)
-        )
 
     # Execute with extended thinking + prompt caching
     model = get_model(agent_code)
@@ -469,7 +441,11 @@ async def check_and_execute(agent_code: str):
     )
 
     # Apply wiki updates (with diff logging)
-    wiki_manager.apply_updates(agent_code, wiki_updates)
+    threshold_tripped = wiki_manager.apply_updates(agent_code, wiki_updates)
+    if threshold_tripped:
+        await execute_sys(audit_request=
+            f"Wiki replace threshold exceeded for {agent_code}. "
+            f"Review recent replace_section activity.")
 
     # Append log entries
     for entry in log_entries:
@@ -570,19 +546,60 @@ Additional context loaded per execution (cacheable via prompt caching):
 ```markdown
 ## Framework View (tiered per Framework §12)
 - SG, TG: §1 + §2 + §9 + §10 + project addendum (~12k tokens)
-- SYS: §1 + §2 + §5 + §10 (~18k tokens)
-- SA, TA, BR, BTA: Framework Summary from §12.1 (~2k tokens)
+- SYS: §1 + §2 + §5 + §10 + project addendum (~20k tokens)
+- SA, TA, BR, BTA: Framework Summary from §12.1 + project addendum (~4k tokens)
 - SE, TE: none (system prompt is self-contained)
 
 ## UNIVERSAL
 [manifesto.md, cross_agent_rules.md, case_index.md]
 
-## Scope Documents
-[Where agent has access per §3.2]
+## Scope Documents (budget-aware, classification priority)
+[Project addendum classifies docs as spec or management]
+- Full corpus (spec + management): SG, SYS
+- Spec-tier only: SA, TG, TA, BR, BTA
+- Task-scoped: SE, TE (only docs targeted by SCN/TCN, plus manifest)
+When the scope corpus exceeds the agent's available context, spec docs 
+load first. Omitted docs are listed in a manifest (name + version) so 
+the agent knows what exists beyond its loaded set.
 
 ## Your Wiki
 [All wiki pages for this agent]
 ```
+
+**Context loading order:**
+1. System prompt (role + type codes + interaction catalog)
+2. Framework view (tiered per §12)
+3. UNIVERSAL (filtered per D-ARCH-031)
+4. Scope documents (budget-aware, classification priority)
+5. Agent wiki (all pages)
+6. Inbox items (unprocessed)
+7. Referenced archived artifacts (resolved from inbox, budget-aware)
+8. Cycle messages (if continuing a cycle)
+
+**Referenced artifact resolution (SC-5, §7.4 archive → agent grounding):**
+
+When inbox items carry `references` to archived artifacts, the orchestrator resolves those references and injects the bodies as read-only context. This ensures the receiving agent can read the artifact it's acting on (e.g., SG receiving AUTH that references PROP — SG needs the PROP body to write the exchange summary).
+
+Resolution rules:
+- Direct references only (no recursive resolution)
+- Self-references and IDs already in the inbox are skipped
+- Budget is computed per execution: `min(REF_TOTAL_MAX_CEILING, model_context_limit - used_tokens - RESPONSE_RESERVE)` where `used_tokens` includes all prior loading steps (1–6)
+- Priority: inbox order × reference order (first reference of first item = highest priority)
+- Per-artifact cap: `REF_ARTIFACT_MAX_CHARS` (default 32K chars, truncated with archive path)
+- Total budget exceeded: remaining references listed as omitted with archive paths
+- `REF_TOTAL_MAX_CEILING` (default 96K chars) and `RESPONSE_RESERVE` (default 16K tokens) are deployment constants
+- An agent that cannot complete its task due to omitted references produces a NOTE identifying the dependency, rather than proceeding with incomplete information
+
+**Scope document loading (SC-5 extension, budget-aware):**
+
+Scope documents follow the same dynamic budget principle as reference resolution. The project addendum classifies each scope document as `spec` (core specifications agents implement against) or `management` (tracking, overview, strategy, history).
+
+Loading by agent tier:
+- Full corpus (spec + management): SG, SYS
+- Spec-tier only: SA, TG, TA, BR, BTA
+- Task-scoped: SE, TE — orchestrator parses inbox SCN/TCN for targeted documents and loads those in full, plus a document manifest (name + version for all docs)
+
+If an agent cannot complete its task due to missing scope context, it produces a NOTE identifying the needed document rather than proceeding with incomplete information.
 
 The system prompt is self-contained for artifact production (the agent knows its types and routes). Framework context is loaded per the tiered model in Framework §12.
 
@@ -660,6 +677,8 @@ async def execute_sys(audit_request=None):
     all_logs = wiki_manager.read_all_logs()
     execution_log = load_execution_log(since=last_sys_run)
     universal = wiki_manager.read_universal()
+    role_events = load_role_events(since=last_sys_run)
+    snapshot_manifest = load_latest_snapshot_manifest()  # SC-7: drift detection
 
     inbox_content = format_sys_inbox(
         artifacts=all_artifacts,
@@ -667,6 +686,8 @@ async def execute_sys(audit_request=None):
         logs=all_logs,
         execution_log=execution_log,
         framework=load_framework(),
+        role_events=role_events,
+        snapshot_manifest=snapshot_manifest,
         audit_request=audit_request
     )
 
@@ -683,10 +704,16 @@ async def execute_sys(audit_request=None):
         response, "SYS"
     )
 
-    # SYS can write to UNIVERSAL
+    # SYS can write to UNIVERSAL — but validates governance changes first
     universal_updates = [u for u in wiki_updates if u.target == "universal"]
     own_updates = [u for u in wiki_updates if u.target == "own"]
     
+    # Governance validation: SYS checks resolved GOV resolutions against
+    # framework invariants before applying to UNIVERSAL (Framework §3,
+    # UNIVERSAL Authority Boundary). If a resolution conflicts with an
+    # invariant (removes agent responsibility, bypasses V-model gate,
+    # merges roles, weakens scope protection), SYS produces a NEW GOV
+    # back to Admin OP instead of applying. The resolution is NOT written.
     for update in universal_updates:
         wiki_manager.apply_universal_update(update)
     for update in own_updates:
@@ -702,6 +729,12 @@ async def execute_sys(audit_request=None):
                   wiki_updates, thinking_blocks, None)
 ```
 
+**SYS provenance audit (SC-6).** SYS checks archive integrity: every artifact in `artifacts/archive/` must have EITHER a `routing_log.json` entry (normal pipeline) OR an `applied_via: import` marker in its frontmatter (bootstrap import per §14 Step 0, or INIT-OP-001). An artifact with neither is a provenance violation — GOV to Admin OP. During normal operation, `applied_via: import` is not a standard path. If exceptional circumstances require it (missed initialization artifact, system downtime during scope evolution), Admin OP may import via server CLI. Every such import triggers an automatic GOV to Admin OP for acknowledgment, and SYS flags it in the next audit. This is a recovery mechanism, not an operating mode.
+
+**SYS scope drift detection (SC-7).** SYS reads the latest snapshot manifest from `snapshots/` and compares content hashes against live `scope/` files. Hash mismatch = scope drift since last approval. GOV to Admin OP with the specific files that differ. SYS also checks `role_events.jsonl` for `snapshot_failed` events — consecutive failures indicate degraded durability and trigger GOV to Admin OP.
+
+**SYS scope vs governance classification.** When Admin OP requests evaluation via `/sys`, SYS classifies the request before producing GOV: governance (how agents operate within roles) → GOV path. Scope (what the project builds or specification changes) → SYS responds with redirect to OP → SG. Mixed → SYS splits the request. When writing resolved governance decisions to UNIVERSAL, SYS validates against framework invariants (§3 UNIVERSAL Authority Boundary) — a resolution that removes agent responsibilities, bypasses V-model gates, merges roles, or weakens scope protection is returned to Admin OP with the conflict identified, NOT applied.
+
 ---
 
 ## 6. Conversation Cycles
@@ -710,18 +743,20 @@ Bounded multi-turn interactions maintain a messages array across executions. The
 
 ### 6.1 Cycle Definitions
 
-| Cycle type | Participants | Opens on | Closes on |
-|-----------|-------------|----------|-----------|
-| SCN application | SG ↔ SE | SCN-SG-NNN issued | VAL-SG-NNN issued |
-| TCN application | TG ↔ TE | TCN-TG-NNN issued | VAL-TG-NNN with certificate=build |
-| PROP exchange | SG ↔ OP | PROP-SG-NNN issued | AUTH-OP-NNN issued |
-| Triage | TG (internal) | TFR-BTA-NNN received | TRI/ESC/TCN produced |
-| Build scope Q&A | BR ↔ EXT | PRO-SCOPE arrives at BR | VR-BTA-NNN for this scope version, or next PRO-SCOPE |
-| Build test Q&A | BR ↔ EXT | PRO-TEST-BUILD arrives at BR | VR-BTA-NNN for this test version, or next PRO-TEST-BUILD |
-| Build results | BR ↔ EXT | BRQ (results) received from EXT | VR-BTA-NNN relayed to EXT |
-| Build remediation | BR ↔ EXT | TRI relayed to EXT | New results submitted by EXT |
-| DE Q&A | SG ↔ DE | DE_OUT-SG-NNN sent | DE_IN received for that question |
-| GOV exchange | SYS ↔ Admin OP | GOV-SYS-NNN or /sys | /resolve GOV-SYS-NNN [action] |
+| Cycle type | Code ID | Participants | Opens on | Closes on |
+|-----------|---------|-------------|----------|-----------|
+| SCN application | `scn_application` | SG ↔ SE | SCN-SG-NNN issued | VAL-SG-NNN issued |
+| TCN application | `tcn_application` | TG ↔ TE | TCN-TG-NNN issued | VAL-TG-NNN with certificate=build |
+| PROP exchange | `prop_exchange` | SG ↔ OP | PROP-SG-NNN issued | AUTH-OP-NNN issued |
+| Triage | `triage` | TG (internal) | TFR-BTA-NNN received | TRI/ESC/TCN produced |
+| Build scope Q&A | `build_scope_qa` | BR ↔ EXT | PRO-SCOPE arrives at BR | VR-BTA-NNN for this scope version, or next PRO-SCOPE |
+| Build test Q&A | `build_test_qa` | BR ↔ EXT | PRO-TEST-BUILD arrives at BR | VR-BTA-NNN for this test version, or next PRO-TEST-BUILD |
+| Build results | `build_results` | BR ↔ EXT | BRQ (results) received from EXT | VR-BTA-NNN relayed to EXT |
+| Build remediation | `build_remediation` | BR ↔ EXT | TRI relayed to EXT | New results submitted by EXT |
+| DE Q&A | `de_qa` | SG ↔ DE | DE_OUT-SG-NNN sent | DE_IN received for that question |
+| GOV exchange | `gov_exchange` | SYS ↔ Admin OP | GOV-SYS-NNN or /sys | /resolve GOV-SYS-NNN [action] |
+
+Code ID is used in `cycle.type`, filesystem paths (`cycles/active/{id}.json`), and log entries. Display names are for human-facing output (Telegram, `/cycles`).
 
 ### 6.2 Cycle Manager
 
@@ -789,6 +824,14 @@ class CycleManager:
             if cycle.type == cycle_type:
                 return cycle
         return None
+
+    def list_active(self) -> list:
+        """Return all active cycles."""
+        cycles = []
+        for f in os.listdir(self.active_cycles_dir):
+            if f.endswith(".json"):
+                cycles.append(self._load(f))
+        return cycles
 
     def get_activity_summary(self, cycle_type: str) -> list:
         """Return summaries of recent cycles of a given type (active + archived)."""
@@ -946,7 +989,7 @@ sender_instance: SA-S002
 sender_model: claude-sonnet-4-6
 timestamp: 2026-05-20T14:30:00Z
 references:
-  - PRO-SCOPE:v7.2
+  - PRO-SCOPE:v4.1
 priority: P2
 ref_type: null
 status: unprocessed
@@ -956,6 +999,15 @@ status: unprocessed
 
 [artifact content]
 ```
+
+**Thinking sidecar (SC-4).** When an agent execution produces artifacts with extended thinking, the thinking blocks are persisted as a sidecar file alongside the archived artifact:
+
+```
+artifacts/archive/FND-SA-003.md              ← artifact body (immutable)
+artifacts/archive/FND-SA-003.thinking.md     ← thinking blocks (immutable)
+```
+
+Written once at archive time. Never loaded into any agent's per-call grounding (zero context cost). Read on-demand by OP/Admin OP via `vega_thinking(id)`. If no sidecar exists (agent had no thinking, or pre-sidecar artifact), `vega_thinking` falls back to `execution_log.json` via `artifact_index.json`.
 
 ### 7.2 AUTH and SUM — Split Artifacts
 
@@ -1024,11 +1076,222 @@ class Inbox:
 ### 7.4 Archive
 
 ```python
-def archive(artifact: Artifact):
+def archive(artifact: Artifact, thinking_blocks: list = None):
     dest = f"{ARTIFACTS_DIR}/{artifact.id}.md"
     atomic_write(dest, artifact.to_markdown())
     # Archive is IMMUTABLE — no modification after write
+    # SC-4: Persist thinking sidecar alongside artifact
+    if thinking_blocks:
+        thinking_dest = f"{ARTIFACTS_DIR}/{artifact.id}.thinking.md"
+        atomic_write(thinking_dest, "\n\n".join(thinking_blocks))
 ```
+
+**Bootstrap import provenance (SC-6).** Artifacts imported from pre-orchestrator work (§14 Step 0) and INIT-OP-001 carry `applied_via: import` in their frontmatter. During normal operation, every archived artifact must have a routing_log entry. SYS provenance audit: an artifact with NEITHER a routing_log entry NOR an `applied_via: import` marker is a provenance violation — GOV to Admin OP. Emergency imports during operation are possible via Admin OP server CLI but always trigger a GOV for acknowledgment — this is a recovery mechanism, not an operating mode.
+
+### 7.5 Validated-State Snapshots (SC-7)
+
+On each scope approval (AUTH with approve disposition), the orchestrator exports an immutable snapshot of the validated state to durable storage outside its working directory.
+
+**Trigger:** Approve handler (`vega_approve` / `/approve`), after AUTH is issued and the cycle closes. One snapshot per approval. Reject and modify do not snapshot. Both MCP and Telegram approve paths trigger the snapshot.
+
+**Contents — scope + triggering artifacts + verification hashes:**
+
+```
+{SNAPSHOT_LOCAL_DIR}/
+└── SNAP-2026-06-04T103000Z-AUTH-OP-008/
+    ├── manifest.json
+    ├── scope/
+    │   └── [all current scope docs at validated versions]
+    └── artifacts/
+        ├── [approved SCN]
+        ├── [AUTH]
+        └── [SUM]
+```
+
+No decision_log — decisions are audit history in agent wikis (SG `decisions.md`). They accumulate permanently and are never reverted.
+
+**Manifest (verification anchor):**
+
+```json
+{
+    "snapshot_id": "SNAP-{timestamp}-{auth_id}",
+    "timestamp": "ISO-8601",
+    "trigger": "{auth_id}",
+    "approved_artifact": "{scn_id}",
+    "scope_versions": {"doc_name": "vN.N", ...},
+    "content_hashes": {"scope/doc_name.md": "sha256:...", ...}
+}
+```
+
+Content hashes enable verification: compare live scope file hash against snapshot hash to confirm no drift — a local check, no routed request.
+
+**Snapshot creation (`_write_snapshot`):**
+
+```python
+async def _write_snapshot(auth_artifact):
+    """Write validated-state snapshot. Called from both MCP vega_approve 
+    and Telegram /approve after AUTH issues."""
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    snap_id = f"SNAP-{timestamp}-{auth_artifact.id}"
+    snap_dir = f"{SNAPSHOT_LOCAL_DIR}/{snap_id}"
+    
+    try:
+        os.makedirs(snap_dir)
+        # Scope docs
+        shutil.copytree(SCOPE_DIR, f"{snap_dir}/scope")
+        # Triggering artifacts from archive
+        os.makedirs(f"{snap_dir}/artifacts")
+        for ref_id in [auth_artifact.id] + (auth_artifact.references or []):
+            src = f"{ARTIFACTS_DIR}/{ref_id}.md"
+            if os.path.exists(src):
+                shutil.copy(src, f"{snap_dir}/artifacts/")
+        # Manifest with content hashes
+        manifest = {
+            "snapshot_id": snap_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "trigger": auth_artifact.id,
+            "approved_artifact": (auth_artifact.references or [None])[0],
+            "scope_versions": _extract_scope_versions(f"{snap_dir}/scope"),
+            "content_hashes": _compute_content_hashes(snap_dir)
+        }
+        atomic_write(f"{snap_dir}/manifest.json", json.dumps(manifest))
+        # Optional git push
+        if SNAPSHOT_GIT_REMOTE:
+            _git_push_snapshot(snap_dir, snap_id)
+    except Exception as e:
+        # Failure must not block routing — warn OP, log error
+        log_error("snapshot_write", e)
+        role_manager._log_event("snapshot_failed", 
+            trigger=auth_artifact.id, error=str(e))
+        await telegram_bot.send(
+            role_manager.get_telegram_id("OP"),
+            f"⚠️ Snapshot failed for {auth_artifact.id}: {e}. "
+            f"AUTH issued normally. Snapshot durability degraded.")
+```
+
+**Target (deployment-configurable, see §3.1):**
+
+Snapshots are written to `SNAPSHOT_LOCAL_DIR` (outside orchestrator tree). If `SNAPSHOT_GIT_REMOTE` is configured, the snapshot is also committed and pushed. Both targets attempted if configured. Neither blocks the approve flow.
+
+**Failure handling (consistent with §10.2 notification resilience):** Snapshot export must not fail silently. If a write fails: warn OP, log error. The AUTH still issues — routing is never blocked by snapshot failure. SYS flags consecutive snapshot failures in its audit via `snapshot_failed` events in `role_events.jsonl`.
+
+**Restoration (dual 2FA):**
+
+Admin OP can restore scope to any snapshot via `vega_restore(snapshot_id)` (MCP), `/restore SNAP-id` (Telegram), or server CLI `vega restore --snapshot <id>`.
+
+```
+Restoration requires dual authorization:
+1. Admin OP initiates → OTP to Admin OP's Telegram
+2. Admin OP confirms → orchestrator sends consent request to OP
+3. OP confirms → OTP to OP's Telegram
+4. OP confirms → orchestrator executes restoration
+
+Both must confirm. Either can block. Expiry: 15 minutes.
+```
+
+The dual requirement reflects that restoration reverses the effect of OP's prior scope approvals — Admin OP has the technical authority, OP has the scope authority. Neither acts alone.
+
+**Dual 2FA flow (on RoleManager — 2FA only, not file operations):**
+
+```python
+def initiate_restore(self, admin_chat_id, snapshot_id):
+    """Phase 1: Admin OP initiates."""
+    otp = self._generate_otp()
+    self._pending_restores[admin_chat_id] = {
+        "snapshot_id": snapshot_id,
+        "otp": otp,
+        "expires": time.time() + OTP_EXPIRY,
+        "phase": "admin_confirm"
+    }
+    return otp
+
+def confirm_restore_admin(self, admin_chat_id, otp):
+    """Phase 1 confirmed. Prepare Phase 2 (OP consent)."""
+    pending = self._pending_restores.get(admin_chat_id)
+    if not pending or pending["otp"] != otp or time.time() > pending["expires"]:
+        return None
+    snapshot_id = pending["snapshot_id"]
+    op_telegram_id = self.get_telegram_id("OP")
+    op_otp = self._generate_otp()
+    del self._pending_restores[admin_chat_id]
+    self._pending_restores[op_telegram_id] = {
+        "snapshot_id": snapshot_id,
+        "otp": op_otp,
+        "expires": time.time() + OTP_EXPIRY,
+        "phase": "op_consent"
+    }
+    self._log_event("restore_initiated", snapshot_id=snapshot_id)
+    return op_telegram_id, op_otp
+
+def confirm_restore_op(self, op_chat_id, otp):
+    """Phase 2 confirmed. Return snapshot_id for execution."""
+    pending = self._pending_restores.get(op_chat_id)
+    if not pending or pending["otp"] != otp or time.time() > pending["expires"]:
+        return None
+    snapshot_id = pending["snapshot_id"]
+    del self._pending_restores[op_chat_id]
+    return snapshot_id
+```
+
+Note: Three separate pending-action dicts, each with one code path: `_pending_role_actions` (assign/modify/revoke, keyed by chat_id), `_pending_activations` (invite activation, keyed by invite_code), `_pending_restores` (scope restoration, keyed by chat_id).
+
+**Restoration procedure (standalone function — not on RoleManager):**
+
+```python
+async def restore_scope(snapshot_id, executor, telegram_bot, role_manager):
+    """§7.5 restoration. Called after both 2FA confirmations."""
+    snap_dir = f"{SNAPSHOT_LOCAL_DIR}/{snapshot_id}"
+
+    # 1. Pause all agents
+    executor.pause()
+
+    # 2. Back up current scope
+    backup = f"{SNAPSHOT_LOCAL_DIR}/pre-restore-{int(time.time())}"
+    os.makedirs(backup)
+    shutil.copytree(SCOPE_DIR, f"{backup}/scope")
+
+    # 3. Replace scope/
+    shutil.rmtree(SCOPE_DIR)
+    shutil.copytree(f"{snap_dir}/scope", SCOPE_DIR)
+
+    # 4. Log
+    role_manager._log_event("restore_executed", snapshot_id=snapshot_id)
+
+    # 5. SYS audit BEFORE resuming — identify wiki-vs-scope inconsistencies
+    await executor.execute_sys(audit_request=
+        f"Post-restoration audit: scope restored to {snapshot_id}. "
+        f"Identify wiki entries and decisions that reference "
+        f"post-snapshot scope changes now inconsistent with "
+        f"the restored scope. Produce GOV for each inconsistency.")
+
+    # 6. Notify — agents stay paused until Admin OP reviews SYS findings
+    op_id = role_manager.get_telegram_id("OP")
+    admin_id = role_manager.get_telegram_id("ADMIN_OP")
+    await telegram_bot.send(admin_id,
+        f"✅ Scope restored to {snapshot_id}. SYS audit complete — "
+        f"review GOV findings before resuming agents. Use /resume when ready.")
+    await telegram_bot.send(op_id,
+        f"Scope restored to {snapshot_id}. Use /verify to confirm. "
+        f"Re-evaluate post-snapshot changes via normal PROP→AUTH.")
+
+    # Agents remain paused. Admin OP reviews SYS GOVs, then /resume.
+```
+
+Agents do NOT auto-resume. Admin OP reviews SYS findings, resolves inconsistencies, then explicitly resumes. This prevents agents from working with stale knowledge.
+
+**Post-restore:** The archive retains all post-snapshot artifacts (SCNs, AUTHs, SUMs). Their effects on the live scope are gone but the artifacts and reasoning are preserved. Agent wikis are untouched — SYS flags any wiki entries now inconsistent with the restored scope. OP re-evaluates which post-snapshot changes to re-apply through the normal PROP→AUTH cycle.
+
+**New tools:**
+
+| Tool | Role | Description |
+|------|------|-------------|
+| `vega_verify()` | OP, Admin OP | Compare live scope hashes against last snapshot manifest. Returns per-doc match/mismatch + snapshot ID. |
+| `vega_snapshots()` | OP, Admin OP | List available snapshots (id, timestamp, trigger, scope versions). |
+| `vega_restore(snapshot_id)` | Admin OP only | Initiate scope restoration. Requires dual 2FA (Admin OP + OP consent). |
+
+**`role_events.jsonl` schema extension:** Add `snapshot_failed`, `restore_initiated`, `restore_executed` to the action enum.
+
+**CORTEX re-indexing:** Scope restoration triggers re-indexing (scope/ content changed). See CORTEX §18.3.
 
 ---
 
@@ -1107,6 +1370,8 @@ class WikiManager:
 
 ```python
     def apply_updates(self, agent_code: str, updates: List[WikiUpdate]):
+        """Apply wiki updates and return whether SYS threshold was tripped."""
+        threshold_tripped = False
         for update in updates:
             filepath = f"{AGENTS_DIR}/{agent_code}/wiki/{update.file}"
 
@@ -1129,7 +1394,8 @@ class WikiManager:
                     )
 
                 # Check replace threshold
-                self._check_replace_threshold(agent_code)
+                if self._check_replace_threshold(agent_code):
+                    threshold_tripped = True
 
             elif update.action == "append":
                 append_to_file(filepath, update.content)
@@ -1142,6 +1408,8 @@ class WikiManager:
                 self.append_log(agent_code,
                     f"WIKI_NEW_ENTRY | {update.file} | {update.content[:100]}..."
                 )
+
+        return threshold_tripped
 
     def _check_replace_threshold(self, agent_code: str):
         """Track replace_section count per agent between SYS runs.
@@ -1190,6 +1458,14 @@ class WikiManager:
             self.append_log("SYS",
                 f"UNIVERSAL_APPEND | {update.file} | {update.content[:200]}..."
             )
+
+    def read_log(self, agent_code: str, n: int = 10) -> str:
+        """Return last N log entries for one agent, parsed by ## headers."""
+        filepath = f"{AGENTS_DIR}/{agent_code}/wiki/log.md"
+        content = read_file(filepath)
+        entries = content.split("\n## ")
+        last_n = entries[-n:] if len(entries) > n else entries
+        return "\n## ".join(last_n)
 ```
 
 ---
@@ -1315,7 +1591,11 @@ admin_backlog = Backlog(ADMIN_BACKLOG_DIR)
 
 ```python
 class TelegramBot:
-    async def notify(self, artifact: Artifact):
+    async def notify(self, artifact: Artifact, role: str = "OP"):
+        chat_id = role_manager.get_telegram_id(role)
+        if not chat_id:
+            return
+
         priority_emoji = {"P0": "🔴", "P1": "🟠", "P2": "🟡", "P3": "🟢"}
         emoji = priority_emoji.get(artifact.priority, "🟡")
 
@@ -1325,17 +1605,30 @@ class TelegramBot:
         thinking = self._get_thinking_summary(artifact)
         thinking_section = f"\n💭 *SG reasoning:* {thinking}\n" if thinking else ""
 
+        # Adapt actions to role
+        if role == "OP":
+            actions = (
+                f"Reply to discuss, or:\n"
+                f"/approve {artifact.id}\n"
+                f"/reject {artifact.id} [reason]\n"
+                f"/modify {artifact.id} [instructions]"
+            )
+        elif role == "ADMIN_OP":
+            actions = (
+                f"Review and:\n"
+                f"/resolve {artifact.id} [action]"
+            )
+        else:
+            actions = ""
+
         msg = (
             f"{emoji} **{artifact.id}** ({artifact.priority})\n"
             f"From: {artifact.sender} ({artifact.sender_model})\n"
             f"{summary}\n"
             f"{thinking_section}\n"
-            f"Reply to discuss, or:\n"
-            f"/approve {artifact.id}\n"
-            f"/reject {artifact.id} [reason]\n"
-            f"/modify {artifact.id} [instructions]"
+            f"{actions}"
         )
-        await self.send(msg)
+        await self.send(chat_id, msg)
 
     async def handle_message(self, message):
         """Dispatch by role based on Telegram chat ID."""
@@ -1353,7 +1646,8 @@ class TelegramBot:
         # Read commands — shared across roles, scoped by visibility
         if text.startswith(("/status", "/agent", "/history", "/wiki",
                            "/log", "/thinking", "/cycles", "/agents",
-                           "/routing", "/decisions", "/framework")):
+                           "/routing", "/decisions", "/framework",
+                           "/scope", "/verify", "/snapshots")):
             await self.handle_read_command(chat_id, text, role)
             return
         
@@ -1374,6 +1668,9 @@ class TelegramBot:
             await router.route(auth)
             op_backlog.resolve(artifact_id, auth)
             cycle_manager.close_by_artifact(artifact_id)
+            # SC-7: snapshot on approve (both MCP and Telegram)
+            if SNAPSHOT_ENABLED:
+                await _write_snapshot(auth)
             await self.send(chat_id, f"✅ AUTH issued for {artifact_id}.")
 
         elif text.startswith("/reject"):
@@ -1411,8 +1708,30 @@ class TelegramBot:
             summaries = cycle_manager.get_activity_summary("build_scope_qa")
             await self.send(chat_id, format_activity(summaries))
 
+        elif text == "APPROVE" and role_manager.has_pending_restore(chat_id):
+            # OP consent for restore (§7.5 dual 2FA Phase 2)
+            snapshot_id = role_manager.confirm_restore_op(chat_id, otp=None)
+            if snapshot_id:
+                await restore_scope(snapshot_id, executor, self, role_manager)
+            else:
+                await self.send(chat_id, "Confirmation failed or expired.")
+
+        elif text == "REJECT" and role_manager.has_pending_restore(chat_id):
+            del role_manager._pending_restores[chat_id]
+            admin_id = role_manager.get_telegram_id("ADMIN_OP")
+            await self.send(admin_id, "❌ OP rejected the restoration request.")
+            await self.send(chat_id, "Restoration rejected.")
+
         else:
             # Freeform text during PROP exchange (cycle-internal, §6.4)
+            # Disabled by default — use MCP vega_exchange for substantive exchanges.
+            # Admin OP can enable via TELEGRAM_EXCHANGE_ENABLED when MCP unavailable.
+            if not TELEGRAM_EXCHANGE_ENABLED:
+                await self.send(chat_id,
+                    "Exchange available via MCP only. Use vega_exchange "
+                    "in your Claude session. Quick commands (/approve, "
+                    "/reject, /modify, /request) always work here.")
+                return
             current = op_backlog.get_in_progress()
             if not current:
                 # Check pending — first engagement starts the exchange
@@ -1465,9 +1784,27 @@ class TelegramBot:
                 f"⚠️ Role revocation: {params.role} from {params.name}\n"
                 f"Reply APPROVE or use code {otp}")
 
-        elif text == "APPROVE" and role_manager.has_pending_action(chat_id):
-            role_manager.confirm_pending(chat_id)
-            await self.send(chat_id, "✅ Role action confirmed.")
+        elif text == "APPROVE":
+            if role_manager.has_pending_restore(chat_id):
+                # Restore Phase 1 — Admin OP confirmed
+                op_data = role_manager.confirm_restore_admin(chat_id, otp=None)
+                if op_data:
+                    op_telegram_id, op_otp = op_data
+                    snapshot_id = role_manager._pending_restores[op_telegram_id]["snapshot_id"]
+                    await self.send(op_telegram_id,
+                        f"⚠️ Scope restoration requested by Admin OP.\n"
+                        f"Target: {snapshot_id}\n"
+                        f"Reply APPROVE to consent or REJECT to block.\n"
+                        f"Code for MCP: {op_otp}\n"
+                        f"Expires in 15 minutes.")
+                    await self.send(chat_id, "✅ Your confirmation received. "
+                        "Waiting for OP consent.")
+                else:
+                    await self.send(chat_id, "Confirmation failed or expired.")
+            elif role_manager.has_pending_action(chat_id):
+                # Role action (assign/modify/revoke)
+                role_manager.confirm_pending(chat_id)
+                await self.send(chat_id, "✅ Role action confirmed.")
 
         elif text.startswith("/sys"):
             instruction = text[5:].strip() or None
@@ -1493,6 +1830,14 @@ class TelegramBot:
             code, model = text[7:].strip().split(None, 1)
             model_manager.set(code, model)
             await self.send(chat_id, f"🔧 {code} model → {model}.")
+
+        elif text.startswith("/run"):
+            code = text[5:].strip().upper()
+            if code not in AGENTS:
+                await self.send(chat_id, f"Unknown agent: {code}")
+                return
+            flag_for_execution(code)
+            await self.send(chat_id, f"🚀 {code} queued for immediate execution.")
 
         elif text.startswith("/backlog"):
             # Admin OP sees both backlogs
@@ -1572,6 +1917,54 @@ class TelegramBot:
             history = cycle_manager.get_history_for_role("EXT")
             await self.send(chat_id, format_history(history))
 
+    # --- Read commands (shared across roles, same data sources as MCP read tools) ---
+
+    async def handle_read_command(self, chat_id, text, role):
+        """Handle Telegram read commands. Uses the same data sources as
+        the MCP read-tool contracts (SC-1). Formats for Telegram with
+        4000-char truncation + 'use vega_history for full content' suffix."""
+        cmd = text.split()[0]
+        args = text[len(cmd):].strip()
+
+        if cmd == "/status":
+            data = format_status(self._read_status())
+        elif cmd == "/agent":
+            data = format_agent(self._read_agent(args))
+        elif cmd == "/history":
+            artifact = artifact_store.load_archived(args)
+            routing = routing_log.get_entries(args)
+            data = (f"**{args}**\n\n{artifact.content if artifact else 'Not found'}"
+                    f"\n\n---\nRouting: {format_routing(routing)}")
+        elif cmd == "/thinking":
+            data = self._read_thinking(args)
+        elif cmd == "/wiki":
+            data = format_wiki_map(wiki_manager.read_all(args))
+        elif cmd == "/log":
+            parts = args.split()
+            code, n = parts[0], int(parts[1]) if len(parts) > 1 else 10
+            data = wiki_manager.read_log(code, n)
+        elif cmd == "/cycles":
+            if args:
+                cycle = cycle_manager.get_active_by_artifact(args)
+                if cycle:
+                    data = format_cycle_messages(cycle.messages)
+                else:
+                    data = f"No active cycle for {args}."
+            else:
+                data = format_cycles(cycle_manager.list_active())
+        elif cmd == "/scope":
+            data = self._read_scope(args)
+        elif cmd == "/verify":
+            data = format_verify(self._read_verify())
+        elif cmd == "/snapshots":
+            data = format_snapshots(self._read_snapshots())
+        elif cmd in ("/agents", "/routing", "/decisions", "/framework"):
+            data = self._read_reference(cmd, args)
+        else:
+            data = f"Unknown command: {cmd}"
+
+        await self.send(chat_id, truncate(data, 4000))
+
     # --- Agent response forwarding (push notifications per role) ---
 
     async def forward_to_role(self, artifact, role):
@@ -1591,7 +1984,7 @@ class TelegramBot:
         await self.send(chat_id, msg)
 ```
 
-### 10.4 Role Manager
+### 10.3 Role Manager
 
 ```python
 import hashlib
@@ -1605,7 +1998,9 @@ class RoleManager:
         self.invites_dir = invites_dir        # config/invites/
         self.events_file = events_file        # state/role_events.jsonl
         self.recovery_file = recovery_file    # config/recovery.hash
-        self._pending_actions = {}            # chat_id → {action, params, otp, expires}
+        self._pending_role_actions = {}       # chat_id → {action, params, otp, expires}
+        self._pending_activations = {}        # invite_code → {action, invite, otp, expires}
+        self._pending_restores = {}           # chat_id → {snapshot_id, otp, expires} (§7.5)
 
     # --- Token management ---
 
@@ -1638,7 +2033,7 @@ class RoleManager:
     def initiate_assign(self, chat_id, name, telegram_id, role, project):
         """Start role assignment — generates OTP, stores pending action."""
         otp = self._generate_otp()
-        self._pending_actions[chat_id] = {
+        self._pending_role_actions[chat_id] = {
             "action": "assign",
             "params": {"name": name, "telegram_id": telegram_id, 
                        "role": role, "project": project},
@@ -1648,8 +2043,9 @@ class RoleManager:
         return otp
 
     def confirm_pending(self, chat_id, otp=None):
-        """Confirm pending action. OTP required if confirming via MCP."""
-        pending = self._pending_actions.get(chat_id)
+        """Confirm pending role action. OTP required if confirming via MCP.
+        Returns True/False. Restore flow uses separate methods."""
+        pending = self._pending_role_actions.get(chat_id)
         if not pending or time.time() > pending["expires"]:
             self._log_event("2fa_expired", chat_id=chat_id)
             return False
@@ -1668,11 +2064,11 @@ class RoleManager:
         elif action == "modify":
             self._execute_modify(params)
         
-        del self._pending_actions[chat_id]
+        del self._pending_role_actions[chat_id]
         return True
 
     def has_pending_action(self, chat_id) -> bool:
-        pending = self._pending_actions.get(chat_id)
+        pending = self._pending_role_actions.get(chat_id)
         return pending is not None and time.time() <= pending["expires"]
 
     # --- Invite / Activation (D-ARCH-040) ---
@@ -1739,7 +2135,7 @@ class RoleManager:
 
     def initiate_revoke(self, chat_id, role, name):
         otp = self._generate_otp()
-        self._pending_actions[chat_id] = {
+        self._pending_role_actions[chat_id] = {
             "action": "revoke",
             "params": {"role": role, "name": name},
             "otp": otp,
@@ -1759,7 +2155,7 @@ class RoleManager:
 
     def initiate_modify(self, chat_id, role, changes):
         otp = self._generate_otp()
-        self._pending_actions[chat_id] = {
+        self._pending_role_actions[chat_id] = {
             "action": "modify",
             "params": {"role": role, "changes": changes},
             "otp": otp,
@@ -1802,13 +2198,59 @@ class RoleManager:
                         new_telegram_id=new_admin_telegram_id)
         return code
 
+    # --- Scope restoration 2FA (§7.5) ---
+    # Uses _pending_restores dict (separate from _pending_role_actions and _pending_activations).
+    # Actual file operations in standalone restore_scope() function — 
+    # RoleManager handles only the 2FA flow.
+
+    def initiate_restore(self, admin_chat_id, snapshot_id):
+        """Phase 1: Admin OP initiates."""
+        otp = self._generate_otp()
+        self._pending_restores[admin_chat_id] = {
+            "snapshot_id": snapshot_id,
+            "otp": otp,
+            "expires": time.time() + OTP_EXPIRY,
+        }
+        return otp
+
+    def confirm_restore_admin(self, admin_chat_id, otp):
+        """Phase 1 confirmed. Prepare Phase 2 (OP consent)."""
+        pending = self._pending_restores.get(admin_chat_id)
+        if not pending or pending["otp"] != otp or time.time() > pending["expires"]:
+            return None
+        snapshot_id = pending["snapshot_id"]
+        op_telegram_id = self.get_telegram_id("OP")
+        op_otp = self._generate_otp()
+        del self._pending_restores[admin_chat_id]
+        self._pending_restores[op_telegram_id] = {
+            "snapshot_id": snapshot_id,
+            "otp": op_otp,
+            "expires": time.time() + OTP_EXPIRY,
+        }
+        self._log_event("restore_initiated", snapshot_id=snapshot_id)
+        return op_telegram_id, op_otp
+
+    def confirm_restore_op(self, op_chat_id, otp):
+        """Phase 2 confirmed. Return snapshot_id for execution."""
+        pending = self._pending_restores.get(op_chat_id)
+        if not pending or pending["otp"] != otp or time.time() > pending["expires"]:
+            return None
+        snapshot_id = pending["snapshot_id"]
+        del self._pending_restores[op_chat_id]
+        return snapshot_id
+
+    def has_pending_restore(self, chat_id) -> bool:
+        pending = self._pending_restores.get(chat_id)
+        return pending is not None and time.time() <= pending["expires"]
+
     # --- Audit trail (read by SYS per §5.9 responsibility 6) ---
 
     # role_events.jsonl schema — one JSON object per line:
     # {
     #   "timestamp": "2026-05-28T10:00:00Z",  (ISO-8601, always Z-suffix)
     #   "action": "assign|revoke|modify|invite_created|role_activated|
-    #              recovery_executed|2fa_failed|2fa_expired",
+    #              recovery_executed|2fa_failed|2fa_expired|
+    #              snapshot_failed|restore_initiated|restore_executed",
     #   "actor_role": "ADMIN_OP",              (who initiated — null for self-service activation)
     #   "actor_telegram_id": "12345",           (initiator's telegram)
     #   "target_role": "DE",                    (role being assigned/modified/revoked)
@@ -1883,6 +2325,13 @@ COMMANDS = {
     "/de_activity":  "DE↔SG exchange summaries",
     "/ext_activity": "EXT↔BR exchange summaries",
 
+    # SCOPE DOCUMENTS (SC-3)
+    "/scope":    "Usage: /scope [doc] — List scope docs, or show full content of one",
+
+    # VERIFICATION (SC-7)
+    "/verify":   "Compare live scope hashes against last validated snapshot",
+    "/snapshots":"List available validated-state snapshots",
+
     # REFERENCE
     "/agents":   "List all agents with roles",
     "/routing":  "Usage: /routing [type] — Show where artifact type routes to",
@@ -1902,10 +2351,13 @@ COMMANDS = {
     "/pause":    "Usage: /pause [code] — Pause agent",
     "/resume":   "Usage: /resume [code] — Resume agent",
     "/rotate":   "Usage: /rotate [code] — Rotate instance ID",
-    "/retry":    "Usage: /retry [code] — Re-execute last failed run",
+    "/run":      "Usage: /run [code] — Execute agent immediately (Admin OP)",
     "/model":    "Usage: /model [code] [model-string] — Change agent model",
     "/models":   "Show current model assignments",
     "/config_notify": "Usage: /config_notify [role] [channel] [push|pull]",
+
+    # RECOVERY (SC-7, dual 2FA: Admin OP initiates, OP consents)
+    "/restore":  "Usage: /restore [SNAP-id] — Restore scope to snapshot (dual 2FA)",
 
     # === DE COMMANDS ===
     "/de_respond":  "Usage: /de_respond [artifact-id] [response]",
@@ -1983,15 +2435,22 @@ vega_modify(artifact_id, instructions)
 vega_exchange(artifact_id, message)    # Multi-turn SG↔OP dialogue
 vega_request(message)                   # Submit REQ-OP-NNN to SG
 vega_backlog()                          # Pending PROP items
+vega_scope()                            # List scope docs (SC-3)
+vega_scope(doc)                         # Full content of a scope document (SC-3)
 
 # Monitoring
 vega_status()
 vega_agent(code)
-vega_cycles()
-vega_history(artifact_id)
+vega_cycles()                           # List active cycles
+vega_cycles(artifact_id)                # Read cycle messages for an exchange
+vega_history(artifact_id)               # Artifact body + routing trail (SC-2)
 vega_thinking(artifact_id)
 vega_wiki(code)
 vega_log(code, n)
+
+# Verification (SC-7)
+vega_verify()                           # Compare live scope hashes vs last snapshot
+vega_snapshots()                        # List available validated-state snapshots
 
 # Cross-channel visibility (read-only)
 vega_de_activity()                      # DE↔SG exchange summaries
@@ -2026,10 +2485,18 @@ vega_status()
 vega_backlog()                          # All backlogs (OP + Admin OP)
 vega_agent(code)
 vega_cycles()
-vega_history(artifact_id)
+vega_cycles(artifact_id)                # Read cycle messages for an exchange
+vega_history(artifact_id)               # Artifact body + routing trail (SC-2)
 vega_thinking(artifact_id)
 vega_wiki(code)
 vega_log(code, n)
+vega_scope()                            # List scope docs
+vega_scope(doc)                         # Full content of a scope document
+
+# Verification and recovery (SC-7)
+vega_verify()                           # Compare live scope hashes vs last snapshot
+vega_snapshots()                        # List available snapshots
+vega_restore(snapshot_id)               # Restore scope to snapshot (dual 2FA: Admin OP + OP)
 ```
 
 **DE tools (domain expertise):**
@@ -2038,6 +2505,8 @@ vega_de_respond(artifact_id, response)  # Respond to DE_OUT
 vega_de_observe(message)                # Initiate domain observation to SG
 vega_de_history()                       # Own DE↔SG exchange history
 vega_de_pending()                       # Outstanding DE_OUT awaiting response
+vega_scope()                            # List scope docs
+vega_scope(doc)                         # Full content of a scope document
 ```
 
 **EXT tools (build interaction):**
@@ -2046,6 +2515,8 @@ vega_ext_submit(results)                # Submit test results / build report
 vega_ext_ask(question)                  # Ask BR a question
 vega_ext_history()                      # Own BR↔EXT exchange history
 vega_ext_pending()                      # Outstanding BRP awaiting response
+vega_scope()                            # List scope docs
+vega_scope(doc)                         # Full content of a scope document
 ```
 
 ### 12.3 MCP Server Implementation
@@ -2062,27 +2533,61 @@ ROLE_TOOLS = {
         "vega_approve", "vega_reject", "vega_modify", "vega_request",
         "vega_exchange", "vega_backlog", "vega_status", "vega_agent",
         "vega_cycles", "vega_history", "vega_thinking", "vega_wiki",
-        "vega_log", "vega_de_activity", "vega_ext_activity",
+        "vega_log", "vega_scope", "vega_de_activity", "vega_ext_activity",
+        "vega_verify", "vega_snapshots",
     ],
     "ADMIN_OP": [
         "vega_sys", "vega_resolve", "vega_exchange",
         "vega_assign_role", "vega_modify_role", "vega_revoke_role",
         "vega_roles", "vega_activate_role",
-        "vega_model", "vega_rotate", "vega_pause", "vega_resume",
+        "vega_model", "vega_rotate", "vega_pause", "vega_resume", "vega_run",
         "vega_config_notifications",
         "vega_status", "vega_backlog", "vega_agent", "vega_cycles",
         "vega_history", "vega_thinking", "vega_wiki", "vega_log",
+        "vega_scope", "vega_verify", "vega_snapshots", "vega_restore",
     ],
     "DE": [
         "vega_de_respond", "vega_de_observe",
         "vega_de_history", "vega_de_pending",
+        "vega_scope",
     ],
     "EXT": [
         "vega_ext_submit", "vega_ext_ask",
         "vega_ext_history", "vega_ext_pending",
+        "vega_scope",
     ],
 }
+```
 
+**Read-tool contracts (SC-1).** Read tools are pure queries — they modify no state, create no artifacts, and route nothing. The contract below defines the data source, return content, and role access for every read tool. The implementer may dispatch via a shared `_handle_read_tool` method or per-tool methods — the contract is the same either way.
+
+| Tool | Data source | Returns | Roles |
+|------|-----------|---------|-------|
+| `vega_status()` | Inboxes, backlogs, active cycles, SYS watermark | System overview: per-agent inbox count, pending PROP/GOV counts, active cycle count, last SYS run | OP, Admin OP |
+| `vega_agent(code)` | execution_log, wiki dir, model_assignments, inbox | Agent detail: last execution, model, instance ID, wiki size, inbox count | OP, Admin OP |
+| `vega_cycles()` | Active cycles directory | List: id, type, participants, turn count, opened_at | OP, Admin OP |
+| `vega_cycles(artifact_id)` | Active cycle messages array | Full cycle messages for the exchange anchored to this artifact. Enables MCP-driven exchanges without switching to Telegram. | OP, Admin OP |
+| `vega_history(id)` | `artifacts/archive/{id}.md` (primary) + `routing_log.json` (secondary) | **Full artifact body** from archive + routing metadata. Body is primary; routing is supplementary. | OP, Admin OP |
+| `vega_thinking(id)` | `artifacts/archive/{id}.thinking.md` (sidecar, SC-4); fallback: `execution_log.json` via `artifact_index.json` | Agent thinking blocks. Empty if none. | OP, Admin OP |
+| `vega_wiki(code)` | `agents/{code}/wiki/` | File map: filename → size | OP, Admin OP |
+| `vega_log(code, n)` | `agents/{code}/wiki/log.md` | Last N log entries | OP, Admin OP |
+| `vega_scope()` | `scope/` directory | List: doc name, version, size, last modified | OP, Admin OP, DE, EXT |
+| `vega_scope(doc)` | `scope/{doc}` | Full document content (no truncation) | OP, Admin OP, DE, EXT |
+| `vega_backlog()` | `op_backlog/pending/` or `admin_backlog/pending/` | Pending items: id, type, priority, sender, timestamp | OP (own), Admin OP (all) |
+| `vega_de_activity()` | Active + archived `de_qa` cycles | DE↔SG exchange summaries | OP |
+| `vega_ext_activity()` | Active + archived `build_*` cycles | EXT↔BR exchange summaries | OP |
+| `vega_de_pending()` | Active cycles involving DE | Cycles awaiting DE response | DE |
+| `vega_ext_pending()` | Active cycles involving EXT | Cycles awaiting EXT response | EXT |
+| `vega_de_history()` | Archived DE↔SG cycles | Recent closed DE exchanges | DE |
+| `vega_ext_history()` | Archived EXT↔BR cycles | Recent closed EXT exchanges | EXT |
+| `vega_verify()` | Last snapshot manifest + live `scope/` | Per-doc hash match/mismatch + snapshot ID | OP, Admin OP |
+| `vega_snapshots()` | `snapshots/` directory | Available snapshots: id, timestamp, trigger | OP, Admin OP |
+| `vega_restore(id)` | `snapshots/{id}/` | Initiate restoration (dual 2FA) | Admin OP only |
+| `vega_roles()` | `config/roles.json` | Role assignments: role → name + telegram_id (no hashes) | Admin OP |
+
+**SC-2 disambiguation: "history" vs "routing trail."** `vega_history(id)` returns the **artifact body** (primary, from the immutable archive) and **routing metadata** (secondary, from `routing_log.json`). These are clearly labelled in the response. The artifact body is what OP needs for decision-making. The routing metadata is supplementary context showing how the artifact moved through the system. If the archive has the artifact but the routing log doesn't (e.g., bootstrap import per SC-6), the body is still returned (`found: true, routing: []`). OP read-path guarantee: OP must always have a path to read the full body of any archived artifact.
+
+```python
 class MCPServer:
     def __init__(self, role_manager, router, op_backlog, admin_backlog,
                  executor, cycle_manager, sequence_manager, wiki_manager):
@@ -2177,7 +2682,31 @@ class MCPServer:
             await self.router.route(auth)
             self.op_backlog.resolve(args["artifact_id"], auth)
             self.cycles.close_by_artifact(args["artifact_id"])
+            # SC-7: snapshot on approve
+            if SNAPSHOT_ENABLED:
+                await self._write_snapshot(auth)
             return f"AUTH issued for {args['artifact_id']}."
+
+        elif tool_name == "vega_reject":
+            rej = create_artifact(type="AUTH", sender="OP",
+                content=f"REJECTED: {args['reason']}",
+                references=[args["artifact_id"]],
+                disposition="reject")
+            rej.id = await self.sequences.next_id("OP", "AUTH")
+            await self.router.route(rej)
+            self.op_backlog.resolve(args["artifact_id"])
+            self.cycles.close_by_artifact(args["artifact_id"])
+            return f"Rejected {args['artifact_id']}."
+
+        elif tool_name == "vega_modify":
+            mod = create_artifact(type="AUTH", sender="OP",
+                content=f"MODIFY: {args['instructions']}",
+                references=[args["artifact_id"]],
+                disposition="modify")
+            mod.id = await self.sequences.next_id("OP", "AUTH")
+            await self.router.route(mod)
+            # Cycle stays open — SG revises and produces new PROP
+            return f"Modification requested for {args['artifact_id']}."
 
         elif tool_name == "vega_request":
             req = create_artifact(type="REQ", sender="OP", content=args["message"])
@@ -2228,7 +2757,7 @@ class MCPServer:
             # Two-phase activation (D-ARCH-040)
             if "otp" in args and args["otp"]:
                 # Phase 2: verify OTP, complete activation, return permanent token
-                pending = self.role_manager._pending_actions.get(args["invite_code"])
+                pending = self.role_manager._pending_activations.get(args["invite_code"])
                 if not pending or time.time() > pending["expires"]:
                     return "Expired. Request a new invite from Admin OP."
                 if args["otp"] != pending["otp"]:
@@ -2250,7 +2779,7 @@ class MCPServer:
                 otp = self.role_manager._generate_otp()
                 await telegram_bot.send(invite["telegram_id"],
                     f"Activation code: {otp}")
-                self.role_manager._pending_actions[args["invite_code"]] = {
+                self.role_manager._pending_activations[args["invite_code"]] = {
                     "action": "activate", "invite": invite,
                     "otp": otp, "expires": time.time() + OTP_EXPIRY
                 }
@@ -2260,6 +2789,26 @@ class MCPServer:
             instruction = args.get("instruction")
             await self.executor.execute_sys(audit_request=instruction)
             return "SYS audit triggered."
+
+        elif tool_name == "vega_pause":
+            self.executor.pause(args.get("agent_code"))
+            return f"Agent {args.get('agent_code', 'all')} paused."
+
+        elif tool_name == "vega_resume":
+            self.executor.resume(args.get("agent_code"))
+            return f"Agent {args.get('agent_code', 'all')} resumed."
+
+        elif tool_name == "vega_rotate":
+            self.executor.rotate_instance(args["agent_code"])
+            return f"Instance rotated for {args['agent_code']}."
+
+        elif tool_name == "vega_model":
+            self.executor.set_model(args["agent_code"], args["model"])
+            return f"Model for {args['agent_code']} set to {args['model']}."
+
+        elif tool_name == "vega_run":
+            flag_for_execution(args["agent_code"])
+            return f"{args['agent_code']} queued for immediate execution."
 
         # DE tools
         elif tool_name == "vega_de_respond":
@@ -2295,11 +2844,48 @@ class MCPServer:
         # Read-only tools (shared across roles, scoped by visibility)
         elif tool_name in ("vega_status", "vega_agent", "vega_cycles",
                            "vega_history", "vega_thinking", "vega_wiki",
-                           "vega_log", "vega_de_activity", "vega_ext_activity",
+                           "vega_log", "vega_scope",
+                           "vega_de_activity", "vega_ext_activity",
                            "vega_de_history", "vega_de_pending",
                            "vega_ext_history", "vega_ext_pending",
                            "vega_roles", "vega_config_notifications"):
             return await self._handle_read_tool(tool_name, args, role)
+
+        # SC-7: Verification and recovery
+        elif tool_name == "vega_verify":
+            manifest = self._load_latest_snapshot_manifest()
+            if not manifest:
+                return "No snapshots available."
+            mismatches = []
+            for path, expected in manifest["content_hashes"].items():
+                live = sha256(read_file(path))
+                if live != expected:
+                    mismatches.append({"file": path, "expected": expected, "live": live})
+            return {
+                "snapshot_id": manifest["snapshot_id"],
+                "timestamp": manifest["timestamp"],
+                "status": "MATCH" if not mismatches else "DRIFT",
+                "mismatches": mismatches
+            }
+
+        elif tool_name == "vega_snapshots":
+            snapshots = []
+            for d in sorted(os.listdir(SNAPSHOT_LOCAL_DIR), reverse=True):
+                m = load_json(f"{SNAPSHOT_LOCAL_DIR}/{d}/manifest.json")
+                snapshots.append({
+                    "id": m["snapshot_id"], "timestamp": m["timestamp"],
+                    "trigger": m["trigger"], "scope_versions": m["scope_versions"]
+                })
+            return snapshots
+
+        elif tool_name == "vega_restore":
+            # Dual 2FA: Admin OP initiates → OTP → OP consents → OTP → execute
+            snapshot_id = args["snapshot_id"]
+            otp = self.role_manager.initiate_restore(
+                role_info["telegram_id"], snapshot_id)
+            return (f"Restoration initiated for {snapshot_id}. "
+                    f"2FA code sent to your Telegram. "
+                    f"After your confirmation, OP will be asked to consent.")
 
         return f"Unknown tool: {tool_name}"
 
@@ -2369,7 +2955,7 @@ async def main():
     cycle_manager = CycleManager()
     op_backlog = Backlog(OP_BACKLOG_DIR)
     admin_backlog = Backlog(ADMIN_BACKLOG_DIR)
-    router = Router(ROUTING_TABLE, OP_BOUND_TYPES, ADMIN_BOUND_TYPES)
+    router = Router(ROUTING_TABLE)
     telegram_bot = TelegramBot()
     executor = AgentExecutor(wiki_manager, sequence_manager,
                              instance_manager, cycle_manager)
@@ -2389,7 +2975,7 @@ async def main():
                 # Check if this opens or closes a cycle
                 cycle_manager.check_cycle_events(artifact)
                 # Route
-                router.route(artifact)
+                await router.route(artifact)
                 artifact_store.archive(artifact)
                 artifact_store.clear_from_outbox(agent_code, artifact)
 
@@ -2411,10 +2997,11 @@ async def main():
             await executor.execute_sys()
             wiki_manager.reset_replace_counters()
 
-        # 3a. SYS triggered by wiki replace threshold
-        if wiki_manager.any_threshold_exceeded():
-            await executor.execute_sys()
-            wiki_manager.reset_replace_counters()
+        # 3a. Wiki replace threshold — checked inline at replace_section time.
+        # When a replace_section call crosses the agent's threshold, the
+        # WikiManager logs the flag and returns True. The executor triggers
+        # SYS immediately from the execution path (no main-loop polling).
+        # See WikiManager.apply_updates → _check_replace_threshold.
 
         # 4. CORTEX periodic maintenance (if active)
         if CORTEX_ENABLED and should_run_cortex_maintenance(execution_count):
@@ -2425,7 +3012,9 @@ async def main():
         # Crash-resilient: a bad tick must not kill the orchestrator.
         # Log error, notify OP, continue to next tick.
         log_error("main_loop", e)
-        await telegram_bot.send(f"⚠️ Tick failed — {type(e).__name__}: {e}")
+        await telegram_bot.send(
+            role_manager.get_telegram_id("ADMIN_OP"),
+            f"⚠️ Tick failed — {type(e).__name__}: {e}")
 
       await asyncio.sleep(POLL_INTERVAL)
 
@@ -2445,8 +3034,20 @@ def should_run_sys(execution_count):
 Normal operation from the first moment. No special init mode.
 
 ```python
-async def initialize_project(initial_input_path: str):
+async def initialize_project(initial_input_path: str, import_dir: str = None):
     """One-time project setup."""
+
+    # 0. (Optional) Import pre-orchestrator artifacts (SC-6)
+    # For projects with prior history, import existing artifacts
+    # with applied_via: import provenance. Run once at initialization —
+    # import is not available during normal operation.
+    if import_dir and os.path.exists(import_dir):
+        for artifact_file in sorted(os.listdir(import_dir)):
+            artifact = load_artifact(f"{import_dir}/{artifact_file}")
+            artifact.frontmatter["applied_via"] = "import"
+            artifact_store.archive(artifact)
+        # Set sequence counters after highest imported ID
+        sequence_manager.initialize_from_archive(artifact_store)
 
     # 1. Create directory structure
     create_directory_structure()
@@ -2485,6 +3086,7 @@ async def initialize_project(initial_input_path: str):
         content=read_file(initial_input_path)
     )
     initial_artifact.id = "INIT-OP-001"
+    initial_artifact.frontmatter["applied_via"] = "import"  # SC-6: no routing_log at init
     artifact_store.archive(initial_artifact)  # Manual archive (router not running yet)
     place_in_inbox("SG", initial_artifact)
 
@@ -2740,14 +3342,14 @@ pyyaml >= 6.0
 | D-ARCH-035 DE non-blocking | DE Q&A cycle (§6.1). `vega_de_respond()` + `vega_de_observe()` MCP tools (§12.2). `pending_external.md` tracking |
 | §12 Agent Context Views | Tiered framework loading in `executor._load_framework_view()` (§5.3) |
 | §12.1 Framework Summary | ~2k token summary loaded for SA, TA, BR, BTA |
-| §12.2 Guardian View (SG, TG) | §1 + §2 + §9 + §10 + addendum (~12k tokens) |
+| §12.2 Guardian View (SG, TG) | §1 + §2 + §9 + §10 + addendum (~12k tokens). All non-minimal agents receive addendum. |
 | §12.3 SYS View | §1 + §2 + §5 + §10 (~18k tokens) |
 | MCP Server | `mcp_server.py` (§12.3). HTTP endpoint, token-scoped tools, role lobby |
 | D-ARCH-011 OP + Admin OP | Separable roles in `config/roles.json`. §13 role system. |
 | D-ARCH-030 Five-layer hierarchy | Structural (every execution re-reads role + wiki + UNIVERSAL). Admin OP resolves contradictions. |
 | §12.4 Minimal View (SE, TE) | System prompt only — no framework context loaded |
 | §13.5 Notification config | `config/notifications.json`. `/config_notify` command (§11). `vega_config_notifications()` MCP tool |
-| §13.6 Break-glass recovery | `config/recovery.hash`. Server CLI `vega recover`. `role_manager.execute_recovery()` (§10.4) |
+| §13.6 Break-glass recovery | `config/recovery.hash`. Server CLI `vega recover`. `role_manager.execute_recovery()` (§10.3) |
 | admin_backlog/ | `Backlog(ADMIN_BACKLOG_DIR)` — GOV items for Admin OP (§10.1) |
 | state/role_events.jsonl | Append-only audit trail. Written by `role_manager._log_event()`. Read by SYS (§5.9 resp. 6) |
 | config/recovery.hash | Break-glass key hash. Written at deployment + on rotation via CLI |

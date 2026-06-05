@@ -54,7 +54,6 @@ A field rename was applied at the declaration point but not traced through all d
 
 ---
 
-*Per-agent wikis maintain their own RC sequences (RC-01, RC-02...) for role-specific corrections. These are independent of U-RC numbers. Framework rules trace to U-RC; agent wikis trace to their own RC. No cross-referencing between namespaces.*
 
 ## U-RC-17: Lecturing expert about roles caused friction
 Agent explained the expert's role in the governance process using directive language ("your role is to review, not to direct build"). Expert disengaged. The correct approach: explain the process (candidate → expert review → confirmed) without positioning it as a constraint on the expert.
@@ -64,3 +63,4 @@ Agent's current configuration conflicted with expert's domain finding. Agent ini
 
 ## U-RC-19: Precedence chain instead of clean data
 When expert clarifications overrode initial data, agent sent build a chain of documents ("this supersedes that"). Build used the wrong version. The fix: update the source file directly so build receives one clean file with final decisions.
+*Per-agent wikis maintain their own RC sequences (RC-01, RC-02...) for role-specific corrections. These are independent of U-RC numbers. Framework rules trace to U-RC; agent wikis trace to their own RC. No cross-referencing between namespaces.*

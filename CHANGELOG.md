@@ -8,6 +8,12 @@
 - **Four external roles:** OP (scope via SG), Admin OP (governance via SYS + role management), DE (domain expertise directly with SG), EXT (build interaction directly with BR). Each role has scoped MCP token + Telegram.
 - **No OP relay:** DE and EXT interact directly with their agents. OP has configurable read visibility into DE and EXT channels. Scope governance unchanged — all scope changes still flow through PROP→AUTH.
 - **OP and Admin OP separable (D-ARCH-026 rewritten):** Same person can hold both. When separated, scope authority and system authority are cleanly divided.
+
+**Spec corrections from live deployment (SC-1 through SC-7):**
+- **OP scope document access:** `vega_scope` tool for all 4 roles (SC-3). OP, Admin OP, DE, EXT can read live scope docs directly.
+- **DE naming convention:** per-issuer sequential (not global). S14 cross-references H2.
+- **§11 title:** "Implementation Notes" (not "for Claude Code").
+- **/exchange removed from §13.1:** exchange via vega_exchange (MCP) or freeform text (Telegram, disabled by default via TELEGRAM_EXCHANGE_ENABLED).
 - **Token-scoped MCP access (D-ARCH-036):** One endpoint, tools filtered by token identity. Unauthenticated lobby for role requests.
 - **2FA for role management (D-ARCH-037):** OTP sent to Admin OP's Telegram. Confirm via Telegram (APPROVE) or MCP (OTP code).
 - **Invite-activate-2FA onboarding (D-ARCH-040):** Admin OP approves → invite code to assignee's Telegram → activate via MCP with OTP → permanent token returned only in MCP.
@@ -36,9 +42,25 @@
 - **32-item launch checklist:** Infrastructure, directory, role bootstrap, functional tests, production.
 - **Framework filename:** Updated to v6 throughout.
 
+**Spec corrections from live deployment (SC-1 through SC-7):**
+- **SC-1: Read-tool handler contract (§12.3).** 20-row contract table defining data source, return content, and role access for every read tool. Closes the class of bugs where implementer wires to wrong source.
+- **SC-2: vega_history disambiguation.** Returns artifact body (primary, from archive) + routing metadata (secondary). OP read-path guarantee documented.
+- **SC-3: vega_scope tool.** OP, Admin OP, DE, EXT can read live scope documents. Added to ROLE_TOOLS, contract table, dispatch.
+- **SC-4: Thinking sidecar.** `{id}.thinking.md` written at archive time. Immutable. `vega_thinking` reads sidecar first, execution_log fallback.
+- **SC-5: Reference resolution + scope loading.** Referenced archived artifacts resolved and injected into agent grounding with dynamic budget. Scope loading budget-aware with spec/management classification.
+- **SC-6: Bootstrap import provenance.** `applied_via: import` for pre-orchestrator and INIT artifacts. SYS provenance audit. Emergency import via Admin OP CLI triggers automatic GOV.
+- **SC-7: Validated-state snapshots (§7.5).** Snapshot on approve. Manifest with SHA-256 hashes. `vega_verify`, `vega_snapshots`, `vega_restore` (dual 2FA). SYS drift detection.
+- **§10.3 renumbered** (was §10.4). RoleManager includes `initiate_restore` for dual-2FA scope restoration.
+- **handle_read_command** defined in Telegram bot — 14 read commands dispatched.
+- **Full MCP dispatch:** vega_reject, vega_modify, vega_pause/resume/rotate/model, vega_scope, vega_verify/snapshots/restore all wired.
+- **TELEGRAM_EXCHANGE_ENABLED = False** — freeform exchange disabled by default, MCP is primary exchange channel.
+- **SNAPSHOT config** in §3.1. SYS reads `snapshots/` for automated drift detection.
+
 ### CORTEX Addon v0.2 BETA
-- Framework reference updated to v6.0
-- No architectural changes
+- **§2.1 Corpus Types:** CORTEX now indexes agent wikis (per-agent, file-level) and scope documents (shared, section-level via `##` headings).
+- **§3.2 Scope navigation:** `cortex_script.navigate_scope()` for section-level relevance ranking within agent context budget.
+- **§18.3 Scope indexing:** Triggers on initialization, post-SE-application, post-VAL. Decoupled from snapshot timing. Cold-start with `validation: tentative`.
+- **Appendix A:** `index_scope()` and `navigate_scope()` methods + 6 helper method signatures. Three concept-extraction paths documented with reconciliation note.
 
 ## v0.2.0 — May 2026
 

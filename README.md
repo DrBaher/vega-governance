@@ -72,7 +72,7 @@ The system runs on a Python orchestrator that executes each agent as a stateless
 |----------|-------------|
 | [Architecture Framework v6](docs/VEGA_Architecture_Framework_v6.md) | 9 agents, 4 roles, 40 decisions, interaction catalog, wiki protocol, V-model gates, tiered context views, role-based access system |
 | [Manifesto v4](docs/VEGA_Manifesto_v4.md) | 8 principles, five-layer hierarchy, intellectual references |
-| [Orchestrator Spec v5](docs/VEGA_Orchestrator_Technical_Spec_v5.md) | Stateless API execution, routing table, conversation cycles, role-scoped MCP + Telegram, RoleManager, 2FA, break-glass recovery |
+| [Orchestrator Spec v5](docs/VEGA_Orchestrator_Technical_Spec_v5.md) | Stateless API execution, routing table, conversation cycles, role-scoped MCP + Telegram, RoleManager, 2FA, break-glass recovery, validated-state snapshots with scope verification and dual-2FA restoration |
 | [CORTEX Addon v0.2 BETA](docs/VEGA_CORTEX_Addon_Specification_v0.2_BETA.md) | Optional concept topology: 4 navigation modes, externalized math, wiki-scale optimization |
 
 ---

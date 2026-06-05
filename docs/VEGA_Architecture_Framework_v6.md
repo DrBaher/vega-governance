@@ -23,7 +23,7 @@ This document defines a multi-agent governance framework applicable to any proje
 10. **No agent blocks on external responses.** All external roles (OP, Admin OP, DE, EXT) have unpredictable response times. When an agent sends an outbound request (PROP, GOV, DE_OUT, BRP), it logs the pending item and continues all work not dependent on the response. Responses feed into the next cycle, not the current one.
 11. **Role-based external access.** Four roles interact with the system: OP (scope decisions via SG), Admin OP (governance + role management via SYS), DE (domain expertise directly with SG), EXT (build interaction directly with BR). Each role has scoped access — they see and control only their domain. OP has full read visibility across all channels.
 
-**Operational context:** Agents run as Claude chat sessions. Context saturation is the core operational constraint — sessions lose precision as context fills. The wiki system is the structural fix: persistent knowledge that survives session boundaries. The handoff protocol ensures continuity when sessions must be replaced.
+**Operational context:** Agents run as stateless API calls via the orchestrator. Each execution starts fresh with full wiki + role + UNIVERSAL — no persistent sessions. The wiki system is the structural memory: persistent knowledge that survives across executions and instance rotations.
 
 ---
 
@@ -39,7 +39,7 @@ This document defines a multi-agent governance framework applicable to any proje
 8. [SCN / TCN Format Reference](#8-scn--tcn-format-reference)
 9. [Interaction Flows](#9-interaction-flows)
 10. [Decision Log](#10-decision-log)
-11. [Implementation Notes for Claude Code](#11-implementation-notes-for-claude-code)
+11. [Implementation Notes](#11-implementation-notes)
 12. [Agent Context Views](#12-agent-context-views)
 13. [Role-Based Access System](#13-role-based-access-system)
 
@@ -159,7 +159,7 @@ This is the exhaustive set. If an interaction is not listed here, it does not ex
 | S11 | OP | SG | AUTH-OP-NNN | Working exchange concludes | OP's final direction. Immutable at issuance. |
 | S12 | SG | (archive) | SUM-SG-NNN | After AUTH received | Exchange summary: what OP challenged, what SG refined, key reasoning. Archived for SYS audit and future sessions. |
 | S13 | OP | SG | REQ-OP-NNN | OP initiates scope work | Operator request — SG triages and produces PROP if action needed |
-| S14 | DE | SG | DE_IN | Domain Expert responds | Expert response to DE_OUT — routed through router, archived |
+| S14 | DE | SG | DE_IN-DE-NNN | Domain Expert responds | See H2 |
 
 ### 2.2 Test Lane
 
@@ -232,7 +232,7 @@ Four roles interact with the system, each scoped to their domain:
 
 | Role | Interacts with | Scope | Visibility |
 |------|---------------|-------|-----------|
-| **OP** (Operator) | SG via PROP/AUTH exchange | All scope decisions, /request | Read visibility into DE and EXT channels (configurable push/pull) |
+| **OP** (Operator) | SG via PROP/AUTH exchange | All scope decisions, /request | Read visibility into DE and EXT channels (configurable push/pull). Read access to live scope documents. |
 | **Admin OP** | SYS via GOV exchange | Governance audit, role management, agent config | Full system visibility |
 | **DE** (Domain Expert) | SG directly | Respond to DE_OUT, initiate domain observations | Own DE↔SG thread only |
 | **EXT** (External Build) | BR directly | Respond to BRP, submit results/questions | Own BR↔EXT thread only |
@@ -305,6 +305,21 @@ Projects frequently reuse the same term for different concepts (e.g., "Phase 2" 
 
 When changing any field's name, type, or semantics: grep EVERY document for EVERY reference. Changes applied at the declaration point without tracing consumption points are incomplete. Four audit rounds each found propagation gaps from the previous round. (Traced to: SG Rule 6, SE Rule 3.)
 
+### UNIVERSAL Authority Boundary
+
+UNIVERSAL/cross_agent_rules.md can add behavioral rules, constraints, authority grants, and coordination patterns within existing agent roles. It CANNOT:
+
+- Remove or reassign an agent's core responsibilities (§5)
+- Bypass V-model gates (§2 interaction catalog)
+- Merge or conflate agent roles (separation of generation and evaluation)
+- Weaken scope protection (PROP→AUTH requirement)
+
+SYS validates every governance resolution against these invariants before writing to UNIVERSAL. A resolution that violates an invariant is returned to Admin OP with the specific conflict identified. Changing an architectural invariant requires a framework version revision — not a runtime governance decision.
+
+**Scope vs governance boundary.** Cross-agent behavioral rules — including authority adjustments, process constraints, and inter-agent coordination rules — are governance decisions. Admin OP requests evaluation via /sys. SYS evaluates cross-agent impact, proposes wording, and produces GOV. Admin OP resolves. SYS writes to UNIVERSAL. If the authority change affects scope protection boundaries, Admin OP consults OP before resolving. This is distinct from scope changes (OP → SG → PROP → AUTH) which modify what the project builds, not how agents operate.
+
+**What UNIVERSAL can do:** grant BR routine engineering authority within scope, add a verification step between agents, establish terminology rules, adjust priority ordering. **What it cannot do:** remove BTA from the build validation gate, let SE apply changes without SG review, move responsibilities between agents, remove the PROP→AUTH requirement.
+
 ---
 
 ## 4. Domain Expert Interaction Protocol
@@ -319,13 +334,13 @@ The Domain Expert interacts directly with SG through their own MCP connection an
 DE_[NNN]_[YYYYMMDD]_[DIR]_[descriptor].md
 ```
 
-Where DIR = OUT (sent to Domain Expert) | IN (received from Domain Expert). NNN is a global sequential number across all Domain Expert communications.
+Where DIR = OUT (sent to Domain Expert) | IN (received from Domain Expert). NNN is per-issuer sequential: DE_OUT uses SG's sequence (SG issues DE_OUT), DE_IN uses DE's sequence (DE issues DE_IN).
 
 ### 4.2 Interaction Rules
 
-1. **Cross-check text vs spreadsheet.** The Domain Expert often provides both a written narrative and an xlsx. Compare item-by-item. Flag every discrepancy — do not resolve by preferring one source. Send contradictions back for explicit confirmation. (Traced to: SG Rules 8, 9 — NEG-006 text="Keep" vs xlsx="Remove"; guardrail text="3 remove" vs xlsx=1.)
+1. **Cross-check text vs spreadsheet.** The Domain Expert often provides both a written narrative and an xlsx. Compare item-by-item. Flag every discrepancy — do not resolve by preferring one source. Send contradictions back for explicit confirmation. (Traced to: SG Rules 8, 9 — text and spreadsheet contradicted on multiple items.)
 
-2. **Verify domain claims against domain reference data.** Even expert-proposed data must satisfy the project's own invariants. If the Domain Expert proposes a negative clinical validity rule, verify no active domain code contradicts it (D79 invariant). (Traced to: SG Rule 7 — Amylase in CSF may violate existence invariant, proposed by Domain Expert.)
+2. **Verify domain claims against domain reference data.** Even expert-proposed data must satisfy the project's own invariants. If the Domain Expert proposes a negative validity rule, verify no active domain reference contradicts it. (Traced to: SG Rule 7 — expert-proposed entry may violate the project's own existence invariant.)
 
 3. **Verify the expert understood the system consequence.** When the Domain Expert's decision depends on understanding system behavior, confirm they understand the consequence. Configuration decisions may have non-obvious downstream effects. (Traced to: U-RC-09.)
 
@@ -365,7 +380,7 @@ Analytical and recommendation role for scope integrity. Receives issues and devi
 | BR | DEV-BR-NNN | Deviation notices from build interaction |
 | TG | ESC-TG-NNN | Scope-level defects from test failure triage |
 | OP | REQ-OP-NNN | Operator request — ad-hoc scope work, change request, question |
-| OP | INIT-OP-001 | One-time project bootstrap (initialization only) |
+| OP | INIT-OP-NNN | One-time project bootstrap (initialization only, single instance) |
 | OP | AUTH-OP-NNN | Authorization / modification / override of SG proposed disposition |
 | DE | DE_IN | Domain Expert response to outstanding question |
 
@@ -397,7 +412,7 @@ Analytical and recommendation role for scope integrity. Receives issues and devi
 1. **Never accept findings at face value.** Trace every finding to the actual spec text and test scenarios before acting. The finding may be correct but the proposed fix wrong, or the finding may be based on a misreading of the spec. (Traced to: U-RC-01 — proposed fix contradicted existing spec text.)
 2. **When patterns get comfortable, break them.** If a judgment feels automatic, that's the signal to stop and verify. Comfort is the failure mode. "This should work" → verify it does. "The spec says..." → quote the exact line. (Traced to: seed — see UNIVERSAL/case_index.md.)
 3. **Never rely on historic documentation without validating against active documentation.** Active documents (scope specification, data specification, technical specification, SCNs, Handoff) are the authority. Audit reports and old session transcripts are evidence of past thinking, not current authority. (Traced to: U-RC-12 — historic documentation used instead of active.)
-4. **No assertions from memory.** Re-read source material for every verification pass. domain identifiers, clinical facts, and cross-references must be looked up, not recalled. (Traced to: U-RC-04.)
+4. **No assertions from memory.** Re-read source material for every verification pass. domain identifiers, domain facts, and cross-references must be looked up, not recalled. (Traced to: U-RC-04.)
 5. **When rejecting an issue, the rejection must be as rigorous as an approval would be.** Cite exact section, explain correct interpretation, identify what the issuer missed.
 6. **Check cascade impact.** Every scope change may affect multiple documents across the full specification document set. Check all cross-references before issuing an SCN.
 7. **Distinguish sequential from competing.** When two specifications seem to conflict, check if they operate sequentially on different inputs rather than competing on the same input. (Traced to: U-RC-02.)
@@ -424,7 +439,7 @@ Independent verification of scope documents. Reviews the current scope for inter
 |--------|---------------|---------|
 | SG | PRO-SCOPE | Validated scope (current ground truth) |
 | SG | REJ-SG-NNN | Rejection of a previous finding |
-| OP | (manual) | Initial scope baseline (Francisco) |
+| OP | (manual) | Initial scope baseline |
 
 #### Outputs
 
@@ -445,8 +460,8 @@ Independent verification of scope documents. Reviews the current scope for inter
 
 1. **Verify your own findings before submission.** Before sending FND-SA-NNN to SG, trace each finding against the full spec text and related sections. If a finding introduces a contradiction with another part of the spec, you've misread something. (Traced to: U-RC-01.)
 2. **Distinguish errors from design decisions.** Something that looks wrong may be an intentional architectural choice documented elsewhere. Check the project decisions log and open issues register before filing. (Traced to: recurring false findings on intentional architectural asymmetries.)
-3. **Check all "Phase 2" references carefully.** The project has three distinct "Phase 2" concepts: Phase 2 (product) (product LLM modes), Phase 2 of corrections (next rerun cycle), and BP2 (DB construction quality checks). Misclassifying these is the most common reasoning error. (Traced to: U-RC-05.)
-4. **For clinical/domain facts, verify from first principles.** Use dimensional analysis (physics, UCUM) or actual domain reference data. Never rely on training data for domain identifiers, clinical classifications, or unit mappings. (Traced to: U-RC-03, U-RC-04.)
+3. **Check all overloaded terminology carefully.** Projects may reuse the same term for distinct concepts. Misclassifying them is the most common reasoning error. Reference the disambiguation table in UNIVERSAL. (Traced to: U-RC-05.)
+4. **For clinical/domain facts, verify from first principles.** Use dimensional analysis (physics, unit standards) or actual domain reference data. Never rely on training data for domain identifiers, clinical classifications, or unit mappings. (Traced to: U-RC-03, U-RC-04.)
 5. **Distinguish severity levels precisely.** ERROR (something is wrong and will produce incorrect behavior), OMISSION (something is missing that must be present), AMBIGUITY (something could be read multiple ways), INCONSISTENCY (two sections contradict). Don't inflate severity.
 
 #### Constraints
@@ -524,7 +539,7 @@ Derives and maintains the test model from validated scope. Ensures V-model bidir
 | SG | PRO-SCOPE | Validated scope (ground truth) — triggers test model update |
 | TA | FND-TA-NNN | Test model findings |
 | BTA | TFR-BTA-NNN | Test failures for triage |
-| OP | (manual) | Initial test model baseline, directives (Francisco) |
+| OP | (manual) | Initial test model baseline, directives |
 
 #### Outputs
 
@@ -558,7 +573,7 @@ Derives and maintains the test model from validated scope. Ensures V-model bidir
 1. **CRITICAL: Never modify test models to accommodate scope ambiguity.** If the scope is the source of the gap, escalate via ESC-TG-NNN. Never adjust test criteria to work around unclear scope. This is the single most important rule for this role. (Traced to: D-ARCH-002.)
 2. **Always trace test model changes to current validated scope.** Never modify based on build feedback alone. Build reports actual outputs; you compare against expected outputs derived from scope. If build's output seems reasonable but doesn't match expected, the question is: does your test model correctly represent what the scope says? Not: does the build output make sense?
 3. **Tests test the spec, not clinical correctness directly.** A test case validates that the implementation matches the specification. If the specification is from a domain perspective wrong, that's a scope defect (escalate via ESC), not a test model defect. The test model is a faithful mirror of the scope — nothing more, nothing less.
-4. **Build version strips criteria completely.** The build-version test spec contains: Test ID, Component description, Spec ref, and Input. No Expected output, no Pass criteria, no Fail criteria. The Test Execution Guide defines how build executes and reports. (Traced to: V-Model separation enacted April 20, Build Directives §4.7.)
+4. **Build version strips criteria completely.** The build-version test spec contains: Test ID, Component description, Spec ref, and Input. No Expected output, no Pass criteria, no Fail criteria. The Test Execution Guide defines how build executes and reports. (Traced to: V-Model separation — build-version specs contain only inputs and spec references, not pass/fail criteria.)
 5. **Verify domain identifiers and domain facts from source.** Never use domain identifiers from memory. Look them up in domain reference data, or authoritative domain sources. (Traced to: U-RC-04.)
 6. **Disambiguate overloaded terms in test design (U9).** Projects reuse terms for different concepts. Test cases must reference the specific meaning. (Traced to: U-RC-05.)
 
@@ -793,7 +808,7 @@ Formal verification gate. Compares actual build results against the full test mo
 
 #### Behavioral Rules
 
-1. **A test can pass for the wrong reason.** 100% does not mean the implementation is correct. If build altered test data or simplified logic to make tests pass instead of implementing the required behavior, the tests pass but the spec is not implemented. When reviewing results, check not just the output but the mechanism that produced it. (Traced to: a prior validation review — "Not accepted as Phase 1 pass" despite 100% rate.)
+1. **A test can pass for the wrong reason.** 100% does not mean the implementation is correct. If build altered test data or simplified logic to make tests pass instead of implementing the required behavior, the tests pass but the spec is not implemented. When reviewing results, check not just the output but the mechanism that produced it. (Traced to: a prior validation review — 100% pass rate not accepted because build altered test data instead of implementing required logic.)
 
 2. **Verify no mocks in test execution.** If TSR-BR-NNN includes test results from a suite containing MagicMock patterns, flag the entire suite as unreliable. Request mock audit grep results as a prerequisite for validation.
 
@@ -815,7 +830,7 @@ Formal verification gate. Compares actual build results against the full test mo
 
 ```
 VR-BTA-NNN: Validation Run [date]
-Scope version: [e.g., scope specification.2]
+Scope version: [e.g., v4.1]
 Test model version: [e.g., v3.0]
 TSR reference: TSR-BR-NNN
 
@@ -950,7 +965,7 @@ Each agent's wiki follows this structure:
 
 ```markdown
 ## [2026-05-20] SG-S003 | Session start | Read: index.md, manifesto.md, process_rules.md
-## [2026-05-20] SG-S003 | Received FND-SA-005 | Analyzing against scope v7.2
+## [2026-05-20] SG-S003 | Received FND-SA-005 | Analyzing against scope v4.1
 ## [2026-05-20] SG-S003 | Consulted PR-03, U1, U10 | Before producing PROP-SG-003
 ## [2026-05-20] SG-S003 | Produced PROP-SG-003 | Recommended: accept, draft SCN ready
 ## [2026-05-20] SG-S003 | Wiki update | process_rules.md: added Rule 21 (new cascade pattern)
@@ -1269,7 +1284,7 @@ Analogous to SCN but for test models:
 
 ---
 
-## 11. Implementation Notes for Claude Code
+## 11. Implementation Notes
 
 ### Context Saturation — The Core Problem
 
@@ -1414,6 +1429,8 @@ DOCUMENT MANIFEST — [date]
 
 The full framework document is ~30k tokens. Not all agents need all of it. Context loading is tiered by role to minimize token cost while ensuring each agent has what it needs.
 
+**Project Addendum:** If present, loaded for all agents that receive framework views (all except SE/TE minimal tier). Provides domain context, scope document classification, project-specific decisions, and terminology disambiguation.
+
 ### 12.1 Framework Summary (loaded for: SA, TA, BR, BTA)
 
 VEGA is a 9-agent governance system organized in two V-model lanes (scope and test) connected through a build execution layer, with a System Auditor providing governance oversight.
@@ -1442,7 +1459,6 @@ Sections loaded for guardians as cacheable context:
 - §2 Interaction Catalog — full routing knowledge
 - §9 Interaction Flows — process understanding (triage destinations, validation paths)
 - §10 Decision Log — D-ARCH-NNN references for analysis
-- Project Addendum (if present) — domain context (SG only; TG receives addendum only if project-specific test decomposition requires domain knowledge)
 
 Guardians analyse, triage, and decide. They need the interaction catalog and flows to route correctly (SG: FND→PROP→SCN vs REJ; TG: TFR→TRI vs ESC vs TCN). Summary alone isn't sufficient for triage decisions.
 
@@ -1477,7 +1493,7 @@ Four external roles interact with the VEGA system:
 
 | Role | Agent channel | Scope of authority | Visibility |
 |------|--------------|-------------------|-----------|
-| **OP** | SG | Scope decisions: /request, /approve, /reject, /modify, /exchange | Read visibility into DE and EXT channels (configurable push/pull) |
+| **OP** | SG | Scope decisions: /request, /approve, /reject, /modify; exchange via vega_exchange (MCP) or freeform text (Telegram, disabled by default) | Read visibility into DE and EXT channels (configurable push/pull). Read access to live scope documents (`vega_scope`). |
 | **Admin OP** | SYS | Governance: /sys, /resolve. Role management: /role. Agent config: /model, /rotate, /pause, /resume | Full system visibility |
 | **DE** | SG (direct) | Domain expertise: respond to DE_OUT, initiate domain observations | Own DE↔SG exchanges only |
 | **EXT** | BR (direct) | Build interaction: respond to BRP, submit results/questions | Own BR↔EXT exchanges only |

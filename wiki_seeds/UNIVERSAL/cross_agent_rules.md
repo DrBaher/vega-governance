@@ -47,12 +47,18 @@ Domain reference data is the ONLY authority for identifier assignments — not d
 
 > *Example from a prior project:* LCN text (display name) ≠ Part assignment (authoritative). The display name suggested a mapping that the reference data contradicted. The reference data was correct.
 
+[Project-specific entries below this line]
+
 ### Dimensional analysis resolves some ambiguities, not all
 When the domain uses units or measurements, some mappings are deterministic (physics determines the relationship). Others are genuinely ambiguous (multiple valid interpretations). Distinguish the two — don't assume all mappings require expert review when some are resolvable by analysis, and don't assume all are resolvable when some genuinely need expert judgment.
 
 > *Example from a prior project:* [unit] = [property] always (physics). mmol/L = [property] always. Genuinely ambiguous: %, ratio, titer — these required expert review.
 
+[Project-specific entries below this line]
+
 ### Official vs derived reference data
 When the project uses multiple reference data sources, classify each as either official (primary authority, loaded directly) or derived (mapped/translated from another source). The classification determines trust level and update rules. Misclassifying derived data as official causes silent errors when the source changes.
 
 > *Example from a prior project:* Biologie FRA and JDV were classified as domain-standard-official (Layer 1, loaded directly), NOT as terminology-mapped (Layer 2+). This distinction affected which pipeline stage handled them.
+
+[Project-specific entries below this line]
