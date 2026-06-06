@@ -50,7 +50,10 @@ class RoleManager:
         # Async callback (chat_id, text) → awaitable — used to send OTPs/invites
         # to a person's Telegram. Optional so the manager is testable headless.
         self._notify = notify
-        self._pending_actions: dict[str, dict] = {}   # chat_id/invite → pending action
+        # Spec §10.3 — three separate pending stores (no type-mixing one dict):
+        self._pending_role_actions: dict[str, dict] = {}  # chat_id → assign/modify/revoke
+        self._pending_activations: dict[str, dict] = {}   # invite_code → activation
+        self._pending_restores: dict[str, dict] = {}      # chat_id → restore (SC-7)
         self.invites_dir.mkdir(parents=True, exist_ok=True)
         self.roles_file.parent.mkdir(parents=True, exist_ok=True)
         self.events_file.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +84,7 @@ class RoleManager:
 
     def initiate_assign(self, chat_id, name, telegram_id, role, project) -> str:
         otp = self._generate_otp()
-        self._pending_actions[str(chat_id)] = {
+        self._pending_role_actions[str(chat_id)] = {
             "action": "assign",
             "params": {"name": name, "telegram_id": telegram_id,
                        "role": role, "project": project},
@@ -93,7 +96,7 @@ class RoleManager:
 
     def initiate_modify(self, chat_id, role, changes) -> str:
         otp = self._generate_otp()
-        self._pending_actions[str(chat_id)] = {
+        self._pending_role_actions[str(chat_id)] = {
             "action": "modify",
             "params": {"role": role, "changes": changes},
             "actor_telegram_id": str(chat_id),
@@ -104,7 +107,7 @@ class RoleManager:
 
     def initiate_revoke(self, chat_id, role, name) -> str:
         otp = self._generate_otp()
-        self._pending_actions[str(chat_id)] = {
+        self._pending_role_actions[str(chat_id)] = {
             "action": "revoke",
             "params": {"role": role, "name": name},
             "actor_telegram_id": str(chat_id),
@@ -114,14 +117,14 @@ class RoleManager:
         return otp
 
     def has_pending_action(self, chat_id) -> bool:
-        pending = self._pending_actions.get(str(chat_id))
+        pending = self._pending_role_actions.get(str(chat_id))
         return pending is not None and time.time() <= pending["expires"]
 
     async def confirm_pending(self, chat_id, otp: Optional[str] = None) -> bool:
         """Confirm a pending role action. OTP required when confirming via MCP;
         Telegram 'APPROVE' from the actor's own chat is sufficient there."""
         key = str(chat_id)
-        pending = self._pending_actions.get(key)
+        pending = self._pending_role_actions.get(key)
         if not pending or time.time() > pending["expires"]:
             self._log_event("2fa_expired", actor_telegram_id=key, result="failed")
             return False
@@ -137,8 +140,67 @@ class RoleManager:
             self._execute_revoke(params, actor_telegram_id=key)
         elif action == "modify":
             self._execute_modify(params, actor_telegram_id=key)
-        del self._pending_actions[key]
+        del self._pending_role_actions[key]
         return True
+
+    # ─── Restore 2FA (SC-7, dual consent §7.5) — uses _pending_restores ───────
+
+    def has_pending_restore(self, chat_id) -> bool:
+        pending = self._pending_restores.get(str(chat_id))
+        return pending is not None and time.time() <= pending["expires"]
+
+    def initiate_restore(self, admin_chat_id, snapshot_id) -> str:
+        """Phase 1: Admin OP initiates restoration → OTP to Admin OP."""
+        otp = self._generate_otp()
+        self._pending_restores[str(admin_chat_id)] = {
+            "snapshot_id": snapshot_id, "otp": otp,
+            "expires": time.time() + self.otp_expiry, "phase": "admin_confirm",
+        }
+        return otp
+
+    def confirm_restore_admin(self, admin_chat_id, otp=None) -> Optional[tuple]:
+        """Phase 1 confirmed → prepare Phase 2 (OP consent). Returns
+        (op_telegram_id, op_otp) or None. OTP required via MCP; Telegram
+        'APPROVE' from the actor's own chat is sufficient there (otp=None)."""
+        pending = self._pending_restores.get(str(admin_chat_id))
+        if (not pending or pending.get("phase") != "admin_confirm"
+                or time.time() > pending["expires"]):
+            return None
+        if otp is not None and pending["otp"] != otp:
+            self._log_event("2fa_failed", actor_telegram_id=str(admin_chat_id),
+                            result="failed")
+            return None
+        snapshot_id = pending["snapshot_id"]
+        op_telegram_id = self.get_telegram_id("OP")
+        op_otp = self._generate_otp()
+        del self._pending_restores[str(admin_chat_id)]
+        if not op_telegram_id:
+            return None   # no OP to consent — can't proceed via dual 2FA
+        self._pending_restores[str(op_telegram_id)] = {
+            "snapshot_id": snapshot_id, "otp": op_otp,
+            "expires": time.time() + self.otp_expiry, "phase": "op_consent",
+        }
+        self._log_event("restore_initiated", snapshot_id=snapshot_id, result="pending")
+        return op_telegram_id, op_otp
+
+    def confirm_restore_op(self, op_chat_id, otp=None) -> Optional[str]:
+        """Phase 2 confirmed → return snapshot_id for execution, else None.
+        OTP required via MCP; Telegram 'APPROVE' from the OP's own chat is
+        sufficient there (otp=None)."""
+        pending = self._pending_restores.get(str(op_chat_id))
+        if (not pending or pending.get("phase") != "op_consent"
+                or time.time() > pending["expires"]):
+            return None
+        if otp is not None and pending["otp"] != otp:
+            self._log_event("2fa_failed", actor_telegram_id=str(op_chat_id),
+                            result="failed")
+            return None
+        snapshot_id = pending["snapshot_id"]
+        del self._pending_restores[str(op_chat_id)]
+        return snapshot_id
+
+    def cancel_restore(self, chat_id) -> None:
+        self._pending_restores.pop(str(chat_id), None)
 
     # ─── Invite / Activation (D-ARCH-040) ────────────────────────────────────
 

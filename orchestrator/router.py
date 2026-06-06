@@ -67,10 +67,17 @@ ROUTING_TABLE: dict[tuple[str, ...], list[dict[str, str]]] = {
     # archive + routing_log instead of a silent direct-inbox bypass.
     ("DE",  "DE_IN"):         [{"to": "SG"}],
 
-    # System Auditor (§2.7) — Spec v5 §4.1: GOV goes to ADMIN_OP (governance).
-    # Intercepted by ADMIN_BOUND_TYPES before the table lookup; kept here as the
-    # documented destination.
-    ("SYS", "GOV"):           [{"to": "ADMIN_OP"}],
+    # ── Backlog-bound routes (Spec v5 §4.1-4.2) — a route with a `backlog` key
+    # goes to the decision role's backlog (not an agent inbox) + notifies the
+    # role. PROP → OP, GOV → Admin OP. Merged into the single table (SC: the old
+    # OP_BOUND_TYPES / ADMIN_BOUND_TYPES split is eliminated).
+    ("SG",  "PROP"):          [{"to": "OP", "backlog": "op_backlog/pending",
+                                "notify_role": "OP", "exchange_mode": True,
+                                "exchange_partner": "SG"}],
+    # System Auditor (§2.7) — GOV is governance → Admin OP backlog.
+    ("SYS", "GOV"):           [{"to": "ADMIN_OP", "backlog": "admin_backlog/pending",
+                                "notify_role": "ADMIN_OP", "exchange_mode": True,
+                                "exchange_partner": "SYS"}],
 
     # AUTH from OP (Spec §7.2, §13 step 4) — archived immutably and delivered to SG.
     # Routing through the table ensures appearance in routing_log + artifacts/archive.
@@ -83,37 +90,7 @@ ROUTING_TABLE: dict[tuple[str, ...], list[dict[str, str]]] = {
     # NOTE: there is intentionally NO ("OP", "PROP") route. PROP exchange
     # continuation turns are cycle-internal per Spec v5 §6.4 (audit P1-2) —
     # appended to the prop_exchange cycle's messages array and dispatched via
-    # flag_for_execution, never minted as artifacts or routed. The old workaround
-    # route existed only to suppress auto-GOV for the (now removed) deviation.
-}
-
-
-# ─── Backlog-bound types (non-blocking) — Spec v5 §4.2 ───────────────────────
-#
-# Two separate decision queues, one per decision role (Spec §10.1):
-#   OP backlog    — PROP (scope decisions)         → notify OP
-#   Admin backlog — GOV (governance) + role reqs    → notify ADMIN_OP
-
-OP_BOUND_TYPES: dict[tuple[str, str], dict[str, Any]] = {
-    ("SG",  "PROP"): {
-        "queue": "pending",
-        "notify": True,
-        "notify_role": "OP",
-        "priority_field": True,
-        "exchange_mode": True,
-        "exchange_partner": "SG",
-    },
-}
-
-ADMIN_BOUND_TYPES: dict[tuple[str, str], dict[str, Any]] = {
-    ("SYS", "GOV"): {
-        "queue": "pending",
-        "notify": True,
-        "notify_role": "ADMIN_OP",
-        "priority_field": False,
-        "exchange_mode": True,
-        "exchange_partner": "SYS",
-    },
+    # flag_for_execution, never minted as artifacts or routed.
 }
 
 
@@ -125,10 +102,8 @@ ADMIN_BOUND_TYPES: dict[tuple[str, str], dict[str, Any]] = {
 #   DE      — domain expert relay (SG → DE, Spec §12.2)
 #   ARCHIVE — archive-only, no recipient inbox (SG SUM)
 #
-# "OP" / "ADMIN_OP" are NOT in this set. Backlog routing happens BEFORE the
-# ROUTING_TABLE loop via OP_BOUND_TYPES (SG/PROP) and ADMIN_BOUND_TYPES (SYS/GOV),
-# which call _route_to_backlog directly. Listing them here would create
-# unreachable dead code inside the loop.
+# Backlog routes (PROP→OP, GOV→ADMIN_OP) are NOT here — they carry a `backlog`
+# key on the route dict and are handled inside the table loop in route().
 EXTERNAL_TARGETS = {"EXT", "DE", "ARCHIVE"}
 
 
@@ -138,9 +113,7 @@ class Router:
 
     def __init__(self, store: ArtifactStore, state_dir: str | Path,
                  op_backlog=None, telegram_bot=None, cycles=None,
-                 admin_backlog=None,
-                 op_bound_types: dict | None = None,
-                 admin_bound_types: dict | None = None) -> None:
+                 admin_backlog=None) -> None:
         self.store = store
         self.routing_log = Path(state_dir) / "routing_log.json"
         self.op_backlog = op_backlog
@@ -151,9 +124,13 @@ class Router:
         # cycle id (audit NEW-1; Spec §17.2). Optional so the Router can still
         # be constructed in tests/bootstrap before cycles exist.
         self.cycles = cycles
-        self.op_bound_types = op_bound_types if op_bound_types is not None else OP_BOUND_TYPES
-        self.admin_bound_types = (admin_bound_types if admin_bound_types is not None
-                                  else ADMIN_BOUND_TYPES)
+
+    def _backlog_for(self, route: dict[str, Any]):
+        """Pick the decision backlog a backlog-route targets (Spec §4.2)."""
+        bl = route.get("backlog", "") or ""
+        if bl.startswith("admin_backlog") or route.get("notify_role") == "ADMIN_OP":
+            return self.admin_backlog
+        return self.op_backlog
 
     def _cycle_id_for(self, artifact: Artifact,
                       recipients: list[str] | None = None) -> str | None:
@@ -196,46 +173,32 @@ class Router:
         if artifact.type == "REJ" and not artifact.ref_type:
             artifact.ref_type = self._resolve_ref_type(artifact)
 
-        op_key = (artifact.sender, artifact.type)
-        if op_key in self.op_bound_types:
-            spec = self.op_bound_types[op_key]
-            await self._route_to_backlog(artifact, spec, self.op_backlog)
-            self.store.archive_artifact(artifact)
-            role = spec.get("notify_role", "OP")
-            await self._append_log(artifact, routed_to=[role],
-                                   cycle_id=self._cycle_id_for(artifact, [role]))
-            return
-        if op_key in self.admin_bound_types:
-            spec = self.admin_bound_types[op_key]
-            await self._route_to_backlog(artifact, spec, self.admin_backlog)
-            self.store.archive_artifact(artifact)
-            role = spec.get("notify_role", "ADMIN_OP")
-            await self._append_log(artifact, routed_to=[role],
-                                   cycle_id=self._cycle_id_for(artifact, [role]))
-            return
-
         key = self._key_for(artifact)
         if key not in ROUTING_TABLE:
             await self._handle_unknown(artifact, key)
             return
 
+        # Single table loop (Spec §4.1-4.2). A route with a `backlog` key goes to
+        # a decision backlog + notify; otherwise inbox / external / archive.
         recipients: list[str] = []
         for route in ROUTING_TABLE[key]:
             to = route["to"]
             recipients.append(to)
-            if to == "ARCHIVE":
+            if "backlog" in route:
+                await self._route_to_backlog(artifact, route, self._backlog_for(route))
+            elif to == "ARCHIVE":
                 continue
-            if to in EXTERNAL_TARGETS:
+            elif to in EXTERNAL_TARGETS:
                 await self._route_external(artifact, to)
-                continue
-            self.store.inbox(to).deliver(artifact)
+            else:
+                self.store.inbox(to).deliver(artifact)
 
         # Archive after delivery
         self.store.archive_artifact(artifact)
         await self._append_log(artifact, routed_to=recipients,
                                cycle_id=self._cycle_id_for(artifact, recipients))
 
-    async def _route_to_backlog(self, artifact: Artifact, spec: dict[str, Any],
+    async def _route_to_backlog(self, artifact: Artifact, route: dict[str, Any],
                                 backlog) -> None:
         """Place in the given decision backlog (OP or Admin OP); attempt a
         role-targeted Telegram notify. Notify failures must NOT break routing —
@@ -244,9 +207,10 @@ class Router:
         truth (Spec §10.2)."""
         if backlog is not None:
             backlog.add(artifact)
-        if spec.get("notify") and self.telegram_bot is not None:
+        role = route.get("notify_role")
+        if role and self.telegram_bot is not None:
             try:
-                await self.telegram_bot.notify(artifact, role=spec.get("notify_role"))
+                await self.telegram_bot.notify(artifact, role=role)
             except Exception as e:
                 print(f"[router] Telegram notify failed for {artifact.id}: "
                       f"{type(e).__name__}: {e}", flush=True)
@@ -267,14 +231,18 @@ class Router:
         reason = f"Unknown routing key: {key}. Artifact {artifact.id} not delivered."
         gov = make_gov(reason=reason, references=[artifact.id] if artifact.id else [])
         gov.priority = "P1"
-        target_backlog = self.admin_backlog if self.admin_backlog is not None else self.op_backlog
+        # Derive backlog + notify_role from the GOV route entry (NEW-7) instead of
+        # hardcoding, so it stays aligned with the merged table.
+        gov_route = (ROUTING_TABLE.get(("SYS", "GOV")) or [{}])[0]
+        target_backlog = self._backlog_for(gov_route) or self.op_backlog
+        notify_role = gov_route.get("notify_role", "ADMIN_OP")
         if target_backlog is not None:
             target_backlog.add(gov)
         if self.telegram_bot is not None:
             # Audit NEW-3 / Spec §10.2: Telegram notify failures must NOT break
             # archival or routing_log of the offending artifact.
             try:
-                await self.telegram_bot.notify(gov, role="ADMIN_OP")
+                await self.telegram_bot.notify(gov, role=notify_role)
             except Exception as e:
                 print(f"[router] Telegram notify failed for auto-GOV {gov.id}: "
                       f"{type(e).__name__}: {e}", flush=True)

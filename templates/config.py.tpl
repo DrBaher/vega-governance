@@ -89,6 +89,19 @@ CORTEX_SCAN_THRESHOLD = 15       # Below this entry count, agents linear-scan.
 # ─── External Build ──────────────────────────────────────────────────────────
 EXT_BUILD_ENABLED = True
 
+# ─── Validated-state snapshots (Spec v5 §7.5, SC-7) ──────────────────────────
+# On each scope approval, export an immutable snapshot of scope + triggering
+# artifacts + content hashes to durable storage OUTSIDE the orchestrator tree.
+SNAPSHOT_ENABLED = True
+SNAPSHOT_LOCAL_DIR = str(BASE_DIR.parent / "vega-snapshots")  # outside the deployment tree
+SNAPSHOT_GIT_REMOTE = ""          # optional — e.g. "origin" to also commit+push
+
+# ─── Telegram freeform exchange (Spec v5 §3.1) ───────────────────────────────
+# Off by default: freeform OP↔SG / Admin-OP↔SYS dialogue happens via MCP
+# vega_exchange. Quick commands (/approve, /reject, /modify, /request, /resolve)
+# always work regardless of this flag.
+TELEGRAM_EXCHANGE_ENABLED = False
+
 # ─── Anthropic API ───────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 

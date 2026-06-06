@@ -273,6 +273,11 @@ class Orchestrator:
                 await self._maybe_notify_sg_exchange(artifact)
                 self.store.clear_from_outbox(agent_code, artifact)
 
+        # Item #3 (Spec §5.1 + §8): wiki replace_section threshold now triggers SYS
+        # INLINE (this tick) instead of being polled. Agents' results carry
+        # `threshold_tripped`; we collect it and fire SYS once after the gather.
+        threshold_tripped = False
+
         # 2. Execute agents with unprocessed inbox
         tasks = []
         for agent_code in config.AGENTS:
@@ -286,6 +291,8 @@ class Orchestrator:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
                 if isinstance(r, dict):
+                    if r.get("threshold_tripped"):
+                        threshold_tripped = True
                     if r.get("executed"):
                         self._execution_count += 1
                     elif r.get("error") == "missing_system_prompt":
@@ -328,17 +335,26 @@ class Orchestrator:
                 print(f"[main] cycle turn failed ({agent_code}/{cycle_id}): "
                       f"{type(e).__name__}: {e}", flush=True)
                 continue
-            if isinstance(result, dict) and result.get("executed"):
-                self._execution_count += 1
-                reply = result.get("response_text")
-                if reply:
-                    await self.bot.relay_exchange_reply(agent_code, cycle_id, reply)
+            if isinstance(result, dict):
+                if result.get("threshold_tripped"):
+                    threshold_tripped = True
+                if result.get("executed"):
+                    self._execution_count += 1
+                    reply = result.get("response_text")
+                    if reply:
+                        await self.bot.relay_exchange_reply(agent_code, cycle_id, reply)
 
-        # 3. SYS on schedule or threshold (Spec §13 + §5.6)
-        if self._should_run_sys() or self.wiki.any_threshold_exceeded():
-            print("[main] Running SYS audit…")
+        # 3. SYS on schedule (Spec §13) or inline wiki-threshold trigger (§5.1+§8).
+        # The threshold path fires THIS tick (no polling) with a targeted audit
+        # request; reset counters + record the run either way.
+        if self._should_run_sys() or threshold_tripped:
+            print("[main] Running SYS audit…"
+                  + (" (wiki replace threshold)" if threshold_tripped else ""))
             since = self._last_sys_run.isoformat() if self._last_sys_run else None
-            sys_result = await self.executor.execute_sys(since=since)
+            audit_req = ("Wiki replace_section threshold exceeded — review recent "
+                         "replace_section activity across agents." if threshold_tripped
+                         and not self._should_run_sys() else None)
+            sys_result = await self.executor.execute_sys(audit_request=audit_req, since=since)
             # Spec §15.2 — notify OP if SYS itself produces malformed output 3+ times.
             # (Do NOT pause SYS: scheduled audits matter; operator should investigate.)
             if (isinstance(sys_result, dict)

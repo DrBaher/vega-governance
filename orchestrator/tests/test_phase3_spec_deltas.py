@@ -18,7 +18,7 @@ from cycle_manager import CycleManager
 from framework_parser import AGENT_TIER, TIER_SECTIONS, load_framework_view
 from models import Artifact
 from backlog import OPBacklog
-from router import EXTERNAL_TARGETS, OP_BOUND_TYPES, ROUTING_TABLE, Router
+from router import EXTERNAL_TARGETS, ROUTING_TABLE, Router
 from sequence_manager import SequenceManager
 from state_manager import load_json
 

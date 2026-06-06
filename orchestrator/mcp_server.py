@@ -106,6 +106,39 @@ class MCPTools:
         self.state_dir = Path(state_dir)
         self.router = router
 
+    # ─── Validated-state snapshots (SC-7, §7.5) ──────────────────────────────
+
+    async def vega_snapshots(self) -> list[dict[str, Any]]:
+        """List available validated-state snapshots (OP, Admin OP)."""
+        from snapshot_manager import list_snapshots
+        return list_snapshots(self.config)
+
+    async def vega_verify(self, snapshot_id: str = "",
+                          role_info: dict | None = None) -> dict[str, Any]:
+        """Compare live scope hashes vs a snapshot manifest (default: latest).
+        Local check, no routed request (OP, Admin OP)."""
+        from snapshot_manager import verify_scope
+        return verify_scope(self.config, snapshot_id)
+
+    async def vega_restore(self, snapshot_id: str,
+                           role_info: dict | None = None) -> str:
+        """Admin OP only — initiate dual-2FA scope restoration (§7.5). Sends an
+        OTP to the Admin OP's Telegram; OP consent follows before execution."""
+        admin_chat = (role_info or {}).get("telegram_id")
+        if not admin_chat:
+            return "No Admin OP telegram on record — cannot initiate restore."
+        otp = self.role_manager.initiate_restore(admin_chat, snapshot_id)
+        if self.telegram_bot is not None:
+            try:
+                await self.telegram_bot.send(
+                    f"⚠️ Restore to {snapshot_id} — 2FA code {otp}. Reply APPROVE "
+                    f"(or enter the code) to confirm; OP consent will then be "
+                    f"requested.", chat_id=admin_chat)
+            except Exception:
+                pass
+        return (f"2FA required. Code sent to your Telegram. Confirm to request OP "
+                f"consent for restoring scope to {snapshot_id}.")
+
     # ─── Orientation ────────────────────────────────────────────────────────
 
     async def vega_about(self, role_info: dict | None = None) -> dict[str, Any]:
@@ -269,7 +302,7 @@ class MCPTools:
         invitee's Telegram; phase 2 verifies it and returns the permanent token."""
         rm = self.role_manager
         if otp:
-            pending = rm._pending_actions.get(invite_code)
+            pending = rm._pending_activations.get(invite_code)
             if not pending or pending.get("action") != "activate":
                 return "No pending activation. Request a fresh invite."
             import time as _t
@@ -279,7 +312,7 @@ class MCPTools:
                 rm._log_event("2fa_failed", invite_code=invite_code, result="failed")
                 return "Invalid code. Try again."
             token = rm.complete_activation(invite_code)
-            del rm._pending_actions[invite_code]
+            del rm._pending_activations[invite_code]
             if token:
                 return (f"✅ Role activated.\nYour permanent token: {token}\n"
                         f"Update your MCP connection with this token. "
@@ -290,7 +323,7 @@ class MCPTools:
             return "Invalid or expired invite code."
         new_otp = rm._generate_otp()
         import time as _t
-        rm._pending_actions[invite_code] = {
+        rm._pending_activations[invite_code] = {
             "action": "activate", "invite": invite,
             "otp": new_otp, "expires": _t.time() + rm.otp_expiry,
         }
@@ -471,6 +504,11 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     "vega_log":      {"method": "vega_log",      "params": {"code": "string",
                                                             "n":    "integer"}},
 
+    # Validated-state snapshots (SC-7, §7.5)
+    "vega_snapshots": {"method": "vega_snapshots", "params": {}},
+    "vega_verify":    {"method": "vega_verify",    "params": {"snapshot_id": "string"}},
+    "vega_restore":   {"method": "vega_restore",   "params": {"snapshot_id": "string"}},
+
     # OP — scope decisions
     "vega_approve":  {"method": "vega_approve",  "params": {"artifact_id": "string"}},
     "vega_reject":   {"method": "vega_reject",   "params": {"artifact_id": "string",
@@ -536,6 +574,7 @@ ROLE_TOOLS: dict[str | None, list[str]] = {
         "vega_exchange", "vega_backlog", "vega_status", "vega_agent",
         "vega_cycles", "vega_history", "vega_thinking", "vega_wiki",
         "vega_log", "vega_de_activity", "vega_ext_activity",
+        "vega_snapshots", "vega_verify",
     ],
     "ADMIN_OP": [
         "vega_about",
@@ -544,6 +583,7 @@ ROLE_TOOLS: dict[str | None, list[str]] = {
         "vega_roles", "vega_activate_role",
         "vega_model", "vega_rotate", "vega_pause", "vega_resume",
         "vega_config_notifications",
+        "vega_snapshots", "vega_verify", "vega_restore",
         "vega_status", "vega_backlog", "vega_agent", "vega_cycles",
         "vega_history", "vega_thinking", "vega_wiki", "vega_log",
     ],
@@ -555,6 +595,7 @@ ROLE_TOOLS: dict[str | None, list[str]] = {
 ROLE_AWARE_TOOLS = {
     "vega_about", "vega_exchange", "vega_backlog", "vega_assign_role",
     "vega_modify_role", "vega_revoke_role",
+    "vega_verify", "vega_restore",
 }
 
 

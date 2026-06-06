@@ -166,20 +166,28 @@ class TelegramBot:
 
     async def notify(self, artifact: Artifact, role: str | None = None) -> None:
         """Notify a decision role of an inbound backlog item. `role` selects the
-        target chat (OP for PROP, ADMIN_OP for GOV) — Spec v5 §4.2 notify_role.
-        Falls back to the default OP chat when role routing isn't configured."""
+        target chat AND the offered actions (Spec v5 §10.2): OP gets the scope
+        decision verbs; Admin OP (GOV) gets /resolve. Falls back to the default
+        OP chat when role routing isn't configured."""
         emoji = PRIORITY_EMOJI.get(artifact.priority or "P2", "🟡")
         thinking = self._latest_thinking(artifact)
         thinking_section = f"\n💭 _{artifact.sender} reasoning:_ {thinking}\n" if thinking else ""
+        # Role-adapted actions: Admin OP / GOV resolves; OP approves/rejects/modifies.
+        if role == "ADMIN_OP" or artifact.type == "GOV":
+            actions = f"Reply to discuss, or:\n`/resolve {artifact.id} <action>`"
+        elif role == "OP" or role is None:
+            actions = (f"Reply to discuss, or:\n"
+                       f"`/approve {artifact.id}`\n"
+                       f"`/reject {artifact.id} <reason>`\n"
+                       f"`/modify {artifact.id} <instructions>`")
+        else:
+            actions = ""
         msg = (
             f"{emoji} *{artifact.id}* ({artifact.priority or 'P2'})\n"
             f"From: {artifact.sender} ({artifact.sender_model or '?'})\n\n"
             f"{_summary(artifact)}\n"
             f"{thinking_section}\n"
-            f"Reply to discuss, or:\n"
-            f"`/approve {artifact.id}`\n"
-            f"`/reject {artifact.id} <reason>`\n"
-            f"`/modify {artifact.id} <instructions>`"
+            f"{actions}"
         )
         await self.send(msg, role=role)
 
@@ -306,6 +314,9 @@ class TelegramBot:
         app.add_handler(CommandHandler("decisions", self._cmd_decisions))
         app.add_handler(CommandHandler("framework", self._cmd_framework))
         app.add_handler(CommandHandler("cycles", self._cmd_cycles))
+        app.add_handler(CommandHandler("snapshots", self._cmd_snapshots))
+        app.add_handler(CommandHandler("verify", self._cmd_verify))
+        app.add_handler(CommandHandler("restore", self._cmd_restore))
         # Admin OP — role management + notification config (Spec v5 §12.4)
         app.add_handler(CommandHandler("role", self._cmd_role))
         app.add_handler(CommandHandler("roles", self._cmd_roles))
@@ -512,6 +523,13 @@ class TelegramBot:
         # Route through the router: archives immutably + appends routing_log +
         # delivers to SG inbox. AUTH is now an auditable record.
         await self.router.route(auth)
+
+        # SC-7 (§7.5): export a validated-state snapshot on APPROVE only (not
+        # reject/modify). Shared path → both Telegram /approve and MCP vega_approve
+        # get it. Never blocks the approve flow (write_snapshot swallows errors).
+        if disposition == "approve":
+            from snapshot_manager import write_snapshot
+            await write_snapshot(auth, self.config, self.role_manager, self)
 
         emoji_label = {"approve": "✅", "reject": "❌", "modify": "✏️"}[disposition]
         return (
@@ -967,16 +985,27 @@ class TelegramBot:
                 "`vega_request_access()`.")
             return
         text = update.message.text or ""
+        chat_id = update.effective_chat.id
+        is_approve = text.strip().upper() == "APPROVE"
+        rm = self.role_manager
 
-        # Admin OP: confirm a pending 2FA role action with "APPROVE".
-        if role == "ADMIN_OP" and text.strip().upper() == "APPROVE":
-            chat_id = update.effective_chat.id
-            if self.role_manager is not None and self.role_manager.has_pending_action(chat_id):
-                ok = await self.role_manager.confirm_pending(chat_id)
+        # Admin OP: "APPROVE" confirms a pending action. Restore (SC-7 §7.5)
+        # takes precedence over a role action — both can't be pending at once,
+        # but check restore first so the dual-2FA flow is unambiguous.
+        if role == "ADMIN_OP" and is_approve:
+            if rm is not None and rm.has_pending_restore(chat_id):
+                await self._confirm_restore_admin(update, chat_id)
+            elif rm is not None and rm.has_pending_action(chat_id):
+                ok = await rm.confirm_pending(chat_id)
                 await self._reply(update,
                     "✅ Role action confirmed." if ok else "⛔ No valid pending action.")
             else:
-                await self._reply(update, "No pending role action to approve.")
+                await self._reply(update, "No pending action to approve.")
+            return
+
+        # OP: "APPROVE" gives scope-authority consent for a pending restore.
+        if role == "OP" and is_approve and rm is not None and rm.has_pending_restore(chat_id):
+            await self._confirm_restore_op(update, chat_id)
             return
 
         if role == "ADMIN_OP":
@@ -1017,6 +1046,90 @@ class TelegramBot:
         self.cycles.append_turn(cycle, text, role)
         flag_for_execution(self.state_dir, partner, cycle.id)
         await self._reply(update, f"↩️ Forwarded to {partner}.")
+
+    # ─── Validated-state snapshots (SC-7 §7.5) ───────────────────────────────
+
+    async def _cmd_snapshots(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"OP", "ADMIN_OP"}):
+            return
+        from snapshot_manager import list_snapshots
+        snaps = list_snapshots(self.config)
+        if not snaps:
+            await self._reply(update, "No snapshots yet. One is written on each AUTH approve.")
+            return
+        lines = [f"📸 *Snapshots* ({len(snaps)}):"]
+        for s in snaps[:15]:
+            lines.append(f"• `{s['snapshot_id']}` — {s.get('timestamp','?')} "
+                         f"(trigger {s.get('trigger','?')})")
+        await self._reply(update, "\n".join(lines))
+
+    async def _cmd_verify(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update, {"OP", "ADMIN_OP"}):
+            return
+        from snapshot_manager import verify_scope
+        snap_id = ctx.args[0] if ctx.args else ""
+        result = verify_scope(self.config, snap_id)
+        if "error" in result:
+            await self._reply(update, f"⚠️ {result['error']}")
+            return
+        mark = "✅ match" if result["match"] else "⚠️ drift detected"
+        lines = [f"🔍 Verify vs `{result['snapshot_id']}`: {mark}"]
+        for name, status in result["docs"].items():
+            if status != "match":
+                lines.append(f"• {name}: *{status}*")
+        await self._reply(update, "\n".join(lines))
+
+    async def _cmd_restore(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin OP initiates dual-2FA scope restoration (§7.5 phase 1)."""
+        if not await self._authorize(update, {"ADMIN_OP"}):
+            return
+        if not ctx.args:
+            await self._reply(update, "Usage: `/restore <SNAPSHOT-ID>`")
+            return
+        if self.role_manager is None:
+            await self._reply(update, "Role manager unavailable — cannot run dual-2FA restore.")
+            return
+        chat_id = update.effective_chat.id
+        snap_id = ctx.args[0]
+        otp = self.role_manager.initiate_restore(chat_id, snap_id)
+        await self._reply(update,
+            f"⚠️ Restore to `{snap_id}` — technical-authority 2FA code *{otp}*.\n"
+            f"Reply `APPROVE` (or enter the code) to confirm; OP scope-authority "
+            f"consent will then be requested.")
+
+    async def _confirm_restore_admin(self, update: Update, chat_id) -> None:
+        """Phase 1 confirmed → request OP scope-authority consent (phase 2)."""
+        result = self.role_manager.confirm_restore_admin(chat_id)
+        if result is None:
+            await self._reply(update, "⛔ No valid pending restore (or no OP on record to consent).")
+            return
+        op_telegram_id, op_otp = result
+        await self.send(
+            f"⚠️ Admin OP requests scope restoration. Scope-authority 2FA code *{op_otp}*.\n"
+            f"Reply `APPROVE` (or enter the code) to consent — this replaces the live scope.",
+            chat_id=op_telegram_id)
+        await self._reply(update,
+            "✅ Technical authority confirmed. OP scope-authority consent requested — "
+            "restore executes once the OP approves.")
+
+    async def _confirm_restore_op(self, update: Update, chat_id) -> None:
+        """Phase 2 confirmed → execute restoration (§7.5)."""
+        snapshot_id = self.role_manager.confirm_restore_op(chat_id)
+        if snapshot_id is None:
+            await self._reply(update, "⛔ No valid pending restore consent.")
+            return
+        from snapshot_manager import restore_scope
+
+        def _pause_all() -> None:
+            for code in self.config.AGENTS:
+                self.agent_pause(code)
+
+        await self._reply(update, f"⏳ Consent recorded. Restoring scope to `{snapshot_id}`…")
+        ok = await restore_scope(snapshot_id, self.config,
+                                 execute_sys=self.sys_trigger, telegram_bot=self,
+                                 role_manager=self.role_manager, pause_all=_pause_all)
+        if not ok:
+            await self._reply(update, f"⛔ Restore failed — snapshot `{snapshot_id}` not found.")
 
     # ─── Thinking lookup ─────────────────────────────────────────────────────
 

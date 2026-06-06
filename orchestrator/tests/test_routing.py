@@ -6,7 +6,7 @@ Every (sender, type) interaction in the Framework must have a routing entry.
 
 import pytest
 
-from router import ROUTING_TABLE, OP_BOUND_TYPES, ADMIN_BOUND_TYPES, EXTERNAL_TARGETS
+from router import ROUTING_TABLE, EXTERNAL_TARGETS
 
 
 # Expected agent-to-agent interactions from Framework §2.
@@ -45,8 +45,9 @@ EXPECTED_ROUTES = [
     ("BR", "BRP", None, ["EXT"]),
     ("EXT", "BRQ", None, ["BR"]),
     ("SG", "DE_OUT", None, ["DE"]),
-    # SYS (§2.7) — GOV is governance → Admin OP (Spec v5 §4.1)
-    ("SYS", "GOV", None, ["ADMIN_OP"]),
+    # Backlog-bound (Spec v5 §4.1-4.2) — now in the merged ROUTING_TABLE
+    ("SG", "PROP", None, ["OP"]),          # → op_backlog, notify OP
+    ("SYS", "GOV", None, ["ADMIN_OP"]),    # → admin_backlog, notify ADMIN_OP
     # AUTH from OP (§7.2 + §13 step 4)
     ("OP",  "AUTH", None, ["SG"]),
 ]
@@ -55,39 +56,34 @@ EXPECTED_ROUTES = [
 @pytest.mark.parametrize("sender,doc_type,ref_type,recipients", EXPECTED_ROUTES)
 def test_routing_table_covers_framework_interactions(sender, doc_type, ref_type, recipients):
     """Every framework interaction must have a routing entry with the right recipients."""
-    if doc_type == "GOV" and sender == "SYS":
-        # GOV is Admin-OP-bound (Spec v5 §4.2)
-        assert ("SYS", "GOV") in ADMIN_BOUND_TYPES
-        return
-    if ref_type:
-        key = (sender, doc_type, ref_type)
-    else:
-        key = (sender, doc_type)
+    key = (sender, doc_type, ref_type) if ref_type else (sender, doc_type)
     assert key in ROUTING_TABLE, f"Missing routing for {key}"
     actual = [r["to"] for r in ROUTING_TABLE[key]]
     assert set(actual) == set(recipients), f"{key}: expected {recipients}, got {actual}"
 
 
-def test_prop_is_op_bound():
-    assert ("SG", "PROP") in OP_BOUND_TYPES
-    assert OP_BOUND_TYPES[("SG", "PROP")]["exchange_mode"] is True
+def test_prop_is_backlog_route_in_table():
+    # Spec v5 §4.1-4.2 — PROP is a backlog route in the merged ROUTING_TABLE.
+    route = ROUTING_TABLE[("SG", "PROP")][0]
+    assert route["to"] == "OP"
+    assert route["backlog"] == "op_backlog/pending"
+    assert route["notify_role"] == "OP"
+    assert route["exchange_mode"] is True and route["exchange_partner"] == "SG"
 
 
-def test_gov_is_admin_bound():
-    # Spec v5 §4.2 — GOV (governance) goes to the Admin OP backlog, with a
-    # SYS↔Admin OP exchange mode. It is NOT OP-bound anymore.
-    assert ("SYS", "GOV") in ADMIN_BOUND_TYPES
-    assert ("SYS", "GOV") not in OP_BOUND_TYPES
-    assert ADMIN_BOUND_TYPES[("SYS", "GOV")]["notify_role"] == "ADMIN_OP"
-    assert ADMIN_BOUND_TYPES[("SYS", "GOV")]["exchange_partner"] == "SYS"
+def test_gov_is_backlog_route_in_table():
+    # Spec v5 §4.1-4.2 — GOV routes to the Admin OP backlog via the merged table.
+    route = ROUTING_TABLE[("SYS", "GOV")][0]
+    assert route["to"] == "ADMIN_OP"
+    assert route["backlog"] == "admin_backlog/pending"
+    assert route["notify_role"] == "ADMIN_OP"
+    assert route["exchange_partner"] == "SYS"
 
 
 def test_external_targets_recognized():
     assert "EXT" in EXTERNAL_TARGETS
     assert "DE" in EXTERNAL_TARGETS
     assert "ARCHIVE" in EXTERNAL_TARGETS
-    # "OP" is intentionally NOT in EXTERNAL_TARGETS. OP routing happens before
-    # the ROUTING_TABLE loop via OP_BOUND_TYPES (SG/PROP, SYS/GOV). A "to=='OP'"
-    # branch inside the loop would be unreachable dead code; listing OP here
-    # would falsely suggest the loop handles it.
+    # "OP"/"ADMIN_OP" are NOT external targets — they're handled by the `backlog`
+    # branch inside the ROUTING_TABLE loop, not the external-relay path.
     assert "OP" not in EXTERNAL_TARGETS
