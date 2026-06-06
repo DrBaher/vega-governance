@@ -143,10 +143,16 @@ class Archive:
         self.dir = Path(archive_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
 
-    def write(self, artifact: Artifact) -> Path:
+    def write(self, artifact: Artifact,
+              thinking_blocks: list[str] | None = None) -> Path:
         if not artifact.id:
             raise ValueError("Cannot archive artifact without id")
         path = self.dir / f"{artifact.id}.md"
+        # SC-4 / NEW-6 — persist the reasoning that produced this artifact as an
+        # immutable sidecar alongside it (Spec §7.1 + §7.4). Best-effort: a
+        # sidecar failure must never block archival.
+        if thinking_blocks:
+            self.write_thinking(artifact.id, thinking_blocks)
         if path.exists():
             # Already archived (e.g., multi-recipient routing). Don't rewrite.
             # Spec §7.4 immutability rule: the FIRST write wins. If the new
@@ -172,6 +178,33 @@ class Archive:
         artifact.status = "archived"
         atomic_write(path, artifact.to_markdown())
         return path
+
+    def write_thinking(self, artifact_id: str,
+                       thinking_blocks: list[str] | None) -> Path | None:
+        """Write the `{id}.thinking.md` reasoning sidecar (SC-4, §7.1). Immutable
+        like the artifact: first write wins. Never raises — reasoning capture is
+        best-effort and must not block the execution/archival path."""
+        if not artifact_id or not thinking_blocks:
+            return None
+        path = self.dir / f"{artifact_id}.thinking.md"
+        if path.exists():
+            return path
+        try:
+            body = "\n\n---\n\n".join(b for b in thinking_blocks if b)
+            atomic_write(path, f"# Reasoning — {artifact_id}\n\n{body}\n")
+            return path
+        except OSError:
+            return None
+
+    def read_thinking(self, artifact_id: str) -> str | None:
+        """Return the sidecar reasoning for an artifact, or None if absent."""
+        path = self.dir / f"{artifact_id}.thinking.md"
+        if not path.exists():
+            return None
+        try:
+            return _read_text(path)
+        except OSError:
+            return None
 
     def _log_collision(self, message: str) -> None:
         """Append an archive-collision record to artifacts/archive_collisions.log
@@ -232,8 +265,17 @@ class ArtifactStore:
     def get_outbox(self, agent_code: str) -> list[Artifact]:
         return self.outbox(agent_code).list_pending()
 
-    def archive_artifact(self, artifact: Artifact) -> Path:
-        return self.archive.write(artifact)
+    def archive_artifact(self, artifact: Artifact,
+                         thinking_blocks: list[str] | None = None) -> Path:
+        return self.archive.write(artifact, thinking_blocks=thinking_blocks)
+
+    def write_thinking(self, artifact_id: str,
+                       thinking_blocks: list[str] | None) -> Path | None:
+        """Write a reasoning sidecar for an artifact (SC-4, §7.1)."""
+        return self.archive.write_thinking(artifact_id, thinking_blocks)
+
+    def read_thinking(self, artifact_id: str) -> str | None:
+        return self.archive.read_thinking(artifact_id)
 
     def get_recent_artifacts(self, since: str | None = None) -> list[Artifact]:
         return self.archive.get_recent(since)

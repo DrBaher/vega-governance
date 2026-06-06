@@ -340,7 +340,7 @@ class AgentExecutor:
         )
 
         # Update artifact index for /thinking
-        await self._update_artifact_index(artifacts, execution_id)
+        await self._update_artifact_index(artifacts, execution_id, thinking_blocks)
 
         # CORTEX post-execution hook (Spec §5.1 lines 454-457).
         # Gated — stub raises NotImplementedError; we swallow it because the
@@ -469,7 +469,7 @@ class AgentExecutor:
             cycle=cycle, tokens=getattr(response, "usage", None),
             duration_seconds=duration_seconds,
         )
-        await self._update_artifact_index(artifacts, execution_id)
+        await self._update_artifact_index(artifacts, execution_id, thinking_blocks)
 
         return {
             "executed": True, "agent": agent_code, "execution_id": execution_id,
@@ -504,7 +504,9 @@ class AgentExecutor:
         all_agents = [c for c in self.config.AGENTS if c != "SYS"]
         all_wikis = self.wiki.read_all_agents(all_agents)
         all_logs = self.wiki.read_all_logs(all_agents)
-        framework_text = self._load_framework()
+        # NEW-5: SYS gets its §12.3 tiered view (role defs + governance sections,
+        # ~20k tokens), not the full framework truncated at 20K.
+        framework_text = self._load_framework_view("SYS")
         recent_artifacts = self.store.get_recent_artifacts(since=since)
         recent_execution_log = self._load_recent_execution_log(since=since)
 
@@ -580,7 +582,7 @@ class AgentExecutor:
             tokens=getattr(response, "usage", None),
             duration_seconds=None,   # SYS-specific timing tracked elsewhere if needed
         )
-        await self._update_artifact_index(artifacts, execution_id)
+        await self._update_artifact_index(artifacts, execution_id, thinking_blocks)
         return {"executed": True, "agent": "SYS", "execution_id": execution_id,
                 "artifacts": [a.id for a in artifacts]}
 
@@ -1095,13 +1097,21 @@ class AgentExecutor:
             return execution_id
 
     async def _update_artifact_index(self, artifacts: list[Artifact],
-                                     execution_id: str) -> None:
+                                     execution_id: str,
+                                     thinking_blocks: list[str] | None = None) -> None:
         async with LOCKS.get("artifact_index"):
             index = load_json(self.artifact_index_path, default={})
             for a in artifacts:
                 if a.id:
                     index[a.id] = {"execution_id": execution_id, "sender": a.sender}
             atomic_save_json(self.artifact_index_path, index)
+        # SC-4 / NEW-6 — persist a reasoning sidecar per produced artifact, so
+        # vega_thinking can serve it directly from the archive (§7.1/§7.4) without
+        # depending on execution_log retention. Best-effort.
+        if thinking_blocks:
+            for a in artifacts:
+                if a.id:
+                    self.store.write_thinking(a.id, thinking_blocks)
 
     # ─── Malformed output handling (Spec §15.2) ──────────────────────────────
 

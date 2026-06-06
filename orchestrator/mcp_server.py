@@ -207,8 +207,16 @@ class MCPTools:
             "last_execution":   last_exec,
         }
 
-    async def vega_cycles(self) -> list[str]:
-        return sorted(p.stem for p in self.cycles.active_dir.glob("*.json"))
+    async def vega_cycles(self, artifact_id: str = "") -> Any:
+        """List active cycle ids, or — with an artifact_id — the messages array of
+        the cycle that artifact opened (Spec §12.3). Detail mode lets an MCP-driven
+        OP read SG's exchange reply without switching to Telegram."""
+        if not artifact_id:
+            return self.cycles.list_active()
+        messages = self.cycles.get_messages(artifact_id)
+        if messages is None:
+            return {"artifact_id": artifact_id, "found": False, "messages": []}
+        return {"artifact_id": artifact_id, "found": True, "messages": messages}
 
     async def vega_history(self, artifact_id: str) -> dict[str, Any]:
         """Open an artifact: its full body from the immutable archive (Spec §7.4)
@@ -417,6 +425,13 @@ class MCPTools:
         return await self.sys_trigger(instruction or None)
 
     async def vega_thinking(self, artifact_id: str) -> str:
+        # SC-4 / NEW-6 — prefer the immutable archive sidecar (§7.1/§7.4); it
+        # survives execution_log rotation. Fall back to execution_log via
+        # artifact_index for artifacts produced before sidecars existed.
+        if self.store is not None:
+            sidecar = self.store.read_thinking(artifact_id)
+            if sidecar:
+                return sidecar
         index = load_json(self.state_dir / "artifact_index.json", default={})
         record = index.get(artifact_id)
         if not record:
@@ -453,7 +468,46 @@ class MCPTools:
         entries = [text[offsets[i]:offsets[i + 1]] for i in range(len(matches))]
         return "".join(entries[-n:])
 
+    async def vega_scope(self, doc: str = "") -> Any:
+        """Read scope documents directly from scope/ (Spec §12.3, SC-3) — no agent
+        involved. `vega_scope()` lists docs (name, version, size, modified);
+        `vega_scope(doc)` returns one doc's full content. Available to all four
+        human roles so they can inspect the live scope corpus."""
+        import re
+        from datetime import datetime, timezone
+        scope_dir = Path(self.config.SCOPE_DIR)
+        if not scope_dir.exists():
+            return [] if not doc else {"doc": doc, "found": False, "content": None}
+        if doc:
+            # Resolve by exact name or filename stem; never escape scope/.
+            candidates = [p for p in scope_dir.glob("*.md")
+                          if p.name == doc or p.stem == doc or p.name == f"{doc}.md"]
+            if not candidates:
+                return {"doc": doc, "found": False, "content": None}
+            p = candidates[0]
+            return {"doc": p.name, "found": True, "content": p.read_text()}
+        ver_re = re.compile(r"_v(\d+(?:[._]\d+)*)\.md$")
+        out: list[dict[str, Any]] = []
+        for p in sorted(scope_dir.glob("*.md")):
+            st = p.stat()
+            m = ver_re.search(p.name)
+            out.append({
+                "name": p.name,
+                "version": ("v" + m.group(1).replace("_", ".")) if m else "—",
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(
+                    st.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+        return out
+
     # ─── Control ────────────────────────────────────────────────────────────
+
+    async def vega_run(self, code: str) -> str:
+        """Admin OP — run an agent immediately against its inbox (Spec §11,
+        replaces the old /retry). The orchestrator's run primitive executes the
+        agent now if it has unprocessed inbox items."""
+        await self.agent_retry(code.upper())
+        return f"ran {code.upper()}"
 
     async def vega_pause(self, code: str) -> str:
         self.agent_pause(code.upper())
@@ -497,12 +551,13 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     "vega_status":   {"method": "vega_status",   "params": {}},
     "vega_backlog":  {"method": "vega_backlog",  "params": {}},
     "vega_agent":    {"method": "vega_agent",    "params": {"code": "string"}},
-    "vega_cycles":   {"method": "vega_cycles",   "params": {}},
+    "vega_cycles":   {"method": "vega_cycles",   "params": {"artifact_id": "string"}},
     "vega_history":  {"method": "vega_history",  "params": {"artifact_id": "string"}},
     "vega_thinking": {"method": "vega_thinking", "params": {"artifact_id": "string"}},
     "vega_wiki":     {"method": "vega_wiki",     "params": {"code": "string"}},
     "vega_log":      {"method": "vega_log",      "params": {"code": "string",
                                                             "n":    "integer"}},
+    "vega_scope":    {"method": "vega_scope",    "params": {"doc": "string"}},
 
     # Validated-state snapshots (SC-7, §7.5)
     "vega_snapshots": {"method": "vega_snapshots", "params": {}},
@@ -537,6 +592,7 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "invite_code": "string", "otp": "string"}},
     "vega_config_notifications": {"method": "vega_config_notifications", "params": {
         "role": "string", "channel": "string", "mode": "string"}},
+    "vega_run":      {"method": "vega_run",      "params": {"code": "string"}},
     "vega_pause":    {"method": "vega_pause",    "params": {"code": "string"}},
     "vega_resume":   {"method": "vega_resume",   "params": {"code": "string"}},
     "vega_rotate":   {"method": "vega_rotate",   "params": {"code": "string"}},
@@ -573,7 +629,7 @@ ROLE_TOOLS: dict[str | None, list[str]] = {
         "vega_approve", "vega_reject", "vega_modify", "vega_request",
         "vega_exchange", "vega_backlog", "vega_status", "vega_agent",
         "vega_cycles", "vega_history", "vega_thinking", "vega_wiki",
-        "vega_log", "vega_de_activity", "vega_ext_activity",
+        "vega_log", "vega_scope", "vega_de_activity", "vega_ext_activity",
         "vega_snapshots", "vega_verify",
     ],
     "ADMIN_OP": [
@@ -581,14 +637,16 @@ ROLE_TOOLS: dict[str | None, list[str]] = {
         "vega_sys", "vega_resolve", "vega_exchange",
         "vega_assign_role", "vega_modify_role", "vega_revoke_role",
         "vega_roles", "vega_activate_role",
-        "vega_model", "vega_rotate", "vega_pause", "vega_resume",
+        "vega_model", "vega_rotate", "vega_run", "vega_pause", "vega_resume",
         "vega_config_notifications",
         "vega_snapshots", "vega_verify", "vega_restore",
         "vega_status", "vega_backlog", "vega_agent", "vega_cycles",
-        "vega_history", "vega_thinking", "vega_wiki", "vega_log",
+        "vega_history", "vega_thinking", "vega_wiki", "vega_log", "vega_scope",
     ],
-    "DE": ["vega_about", "vega_de_respond", "vega_de_observe", "vega_de_history", "vega_de_pending"],
-    "EXT": ["vega_about", "vega_ext_submit", "vega_ext_ask", "vega_ext_history", "vega_ext_pending"],
+    "DE": ["vega_about", "vega_scope", "vega_de_respond", "vega_de_observe",
+           "vega_de_history", "vega_de_pending"],
+    "EXT": ["vega_about", "vega_scope", "vega_ext_submit", "vega_ext_ask",
+            "vega_ext_history", "vega_ext_pending"],
 }
 
 # Tools whose behaviour depends on the caller's role (they take role_info).

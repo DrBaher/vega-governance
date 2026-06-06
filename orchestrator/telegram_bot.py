@@ -305,7 +305,8 @@ class TelegramBot:
         app.add_handler(CommandHandler("pause", self._cmd_pause))
         app.add_handler(CommandHandler("resume", self._cmd_resume))
         app.add_handler(CommandHandler("rotate", self._cmd_rotate))
-        app.add_handler(CommandHandler("retry", self._cmd_retry))
+        app.add_handler(CommandHandler("run", self._cmd_run))
+        app.add_handler(CommandHandler("retry", self._cmd_run))   # deprecated alias
         app.add_handler(CommandHandler("model", self._cmd_model))
         app.add_handler(CommandHandler("models", self._cmd_models))
         app.add_handler(CommandHandler("request", self._cmd_request))
@@ -314,6 +315,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("decisions", self._cmd_decisions))
         app.add_handler(CommandHandler("framework", self._cmd_framework))
         app.add_handler(CommandHandler("cycles", self._cmd_cycles))
+        app.add_handler(CommandHandler("scope", self._cmd_scope))
         app.add_handler(CommandHandler("snapshots", self._cmd_snapshots))
         app.add_handler(CommandHandler("verify", self._cmd_verify))
         app.add_handler(CommandHandler("restore", self._cmd_restore))
@@ -643,14 +645,15 @@ class TelegramBot:
         new_id = await self.instances.rotate(code)
         await self._reply(update, f"{code} rotated → {new_id}")
 
-    async def _cmd_retry(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _cmd_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Run an agent now against its inbox (Spec §11, replaces /retry)."""
         if not await self._authorize(update, {"ADMIN_OP"}):
             return
         if not ctx.args:
-            await self._reply(update, "Usage: `/retry <CODE>`")
+            await self._reply(update, "Usage: `/run <CODE>`")
             return
         await self.agent_retry(ctx.args[0].upper())
-        await self._reply(update, "Retry queued.")
+        await self._reply(update, f"▶️ Ran {ctx.args[0].upper()}.")
 
     async def _cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update, {"ADMIN_OP"}):
@@ -1008,6 +1011,17 @@ class TelegramBot:
             await self._confirm_restore_op(update, chat_id)
             return
 
+        # #10 (Spec §3.1) — freeform OP↔SG / Admin-OP↔SYS exchange is off by
+        # default; it happens over MCP vega_exchange. Quick commands (/approve,
+        # /reject, /modify, /request, /resolve) and the 2FA APPROVE flows above
+        # always work regardless of this gate.
+        if not getattr(self.config, "TELEGRAM_EXCHANGE_ENABLED", False):
+            await self._reply(update,
+                "Freeform exchange is available via MCP only. Use `vega_exchange` "
+                "in your Claude session. Quick commands (/approve, /reject, "
+                "/modify, /request) still work here.")
+            return
+
         if role == "ADMIN_OP":
             await self._forward_exchange(update, text, backlog=self.admin_backlog,
                                          partner="SYS", role="ADMIN_OP")
@@ -1046,6 +1060,35 @@ class TelegramBot:
         self.cycles.append_turn(cycle, text, role)
         flag_for_execution(self.state_dir, partner, cycle.id)
         await self._reply(update, f"↩️ Forwarded to {partner}.")
+
+    # ─── Scope read (SC-3 §12.3) ─────────────────────────────────────────────
+
+    async def _cmd_scope(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """List scope docs, or `/scope <doc>` for one doc's content. All roles."""
+        if not await self._authorize(update, {"OP", "ADMIN_OP", "DE", "EXT"}):
+            return
+        from pathlib import Path as _P
+        import re
+        scope_dir = _P(self.config.SCOPE_DIR)
+        if not scope_dir.exists():
+            await self._reply(update, "No scope directory configured.")
+            return
+        if ctx.args:
+            doc = ctx.args[0]
+            hits = [p for p in scope_dir.glob("*.md")
+                    if p.name == doc or p.stem == doc or p.name == f"{doc}.md"]
+            if not hits:
+                await self._reply(update, f"No scope doc matching `{doc}`.")
+                return
+            await self._reply(update, hits[0].read_text())
+            return
+        ver_re = re.compile(r"_v(\d+(?:[._]\d+)*)\.md$")
+        lines = ["📚 *Scope docs:*"]
+        for p in sorted(scope_dir.glob("*.md")):
+            m = ver_re.search(p.name)
+            ver = ("v" + m.group(1).replace("_", ".")) if m else "—"
+            lines.append(f"• `{p.name}` ({ver}, {p.stat().st_size} B)")
+        await self._reply(update, "\n".join(lines))
 
     # ─── Validated-state snapshots (SC-7 §7.5) ───────────────────────────────
 
@@ -1180,8 +1223,10 @@ _READ_HELP = """*Monitoring*
 `/backlog` — pending decision items
 `/agent <CODE>` / `/agents` — agent details / list
 `/history <ID>` — routing history for an artifact
-`/cycles` — active conversation cycles
+`/cycles [ID]` — active cycles, or one cycle's messages
+`/scope [doc]` — scope docs, or one doc's content
 `/wiki <CODE>` · `/log <CODE> [N]` · `/thinking <ID>`
+`/snapshots` · `/verify [SNAP-ID]` — validated-state snapshots
 
 *Reference*
 `/routing <TYPE>` · `/decisions [prefix]` · `/framework <§>`"""
@@ -1198,7 +1243,7 @@ _OP_HELP = """*VEGA — OP (scope decisions)*
 
 """ + _READ_HELP + """
 
-Type a plain message during an active PROP exchange to continue with SG."""
+Freeform SG exchange is via MCP `vega_exchange` (unless TELEGRAM_EXCHANGE_ENABLED)."""
 
 _ADMIN_OP_HELP = """*VEGA — Admin OP (governance + administration)*
 
@@ -1213,12 +1258,15 @@ _ADMIN_OP_HELP = """*VEGA — Admin OP (governance + administration)*
 `/config_notify <role> <channel> <mode>`
 
 *Agent control*
-`/pause <CODE>` / `/resume <CODE>` · `/rotate <CODE>` · `/retry <CODE>`
+`/run <CODE>` — run an agent now · `/pause <CODE>` / `/resume <CODE>` · `/rotate <CODE>`
 `/model <CODE> <model>` / `/models`
+
+*Scope restore* (dual 2FA — reply `APPROVE`)
+`/restore <SNAP-ID>` — restore scope to a validated snapshot
 
 """ + _READ_HELP + """
 
-Type a plain message during an active GOV exchange to continue with SYS."""
+Freeform SYS exchange is via MCP `vega_exchange` (unless TELEGRAM_EXCHANGE_ENABLED)."""
 
 _DE_HELP = """*VEGA — Domain Expert*
 

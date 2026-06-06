@@ -126,6 +126,17 @@ class CycleManager:
                 return cycle
         return None
 
+    def list_active(self) -> list[str]:
+        """Sorted ids of all active cycles (NEW-2 — encapsulates the active_dir
+        glob that previously lived inline in mcp_server.vega_cycles)."""
+        return sorted(p.stem for p in self.active_dir.glob("*.json"))
+
+    def get_messages(self, artifact_id: str) -> list[dict] | None:
+        """Return the messages array for the cycle opened by `artifact_id`
+        (Spec §12.3 — vega_cycles detail mode). None if no such active cycle."""
+        cycle = self.get_active_by_artifact(artifact_id)
+        return list(cycle.messages) if cycle is not None else None
+
     def get_by_id(self, cycle_id: str) -> Cycle | None:
         """Load an active cycle by its id (e.g. for execute_cycle_turn dispatch)."""
         path = self.active_dir / _cycle_filename(cycle_id)
