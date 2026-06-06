@@ -384,6 +384,14 @@ This is the only place the router reads an archived artifact. All other routing 
 
 ### 5.1 Execution Trigger
 
+**`flag_for_execution(agent_code, cycle_id=None)`** — marks an agent for execution on the next tick. Two use cases:
+
+1. **Cycle-turn trigger:** A human role sends a message in an exchange → the partner agent needs to execute to respond. Called with `cycle_id` for traceability (which cycle triggered the execution). Example: OP sends exchange message → `flag_for_execution("SG", cycle_id=cycle.id)`.
+
+2. **Direct execution (/run):** Admin OP wants an agent to execute immediately (changed model, updated wiki, wants to see the effect). Called without `cycle_id` — no cycle context, normal inbox execution. Example: `/run SG` → `flag_for_execution("SG")`.
+
+The agent itself doesn't need to know why it was flagged. It reads its inbox and processes whatever's there — cycle context comes from the inbox content, not the flag. `cycle_id` is for operational tracing only.
+
 ```python
 async def check_and_execute(agent_code: str):
     inbox = get_inbox(agent_code)
@@ -442,10 +450,10 @@ async def check_and_execute(agent_code: str):
 
     # Apply wiki updates (with diff logging)
     threshold_tripped = wiki_manager.apply_updates(agent_code, wiki_updates)
-    if threshold_tripped:
-        await execute_sys(audit_request=
-            f"Wiki replace threshold exceeded for {agent_code}. "
-            f"Review recent replace_section activity.")
+    # threshold_tripped is returned in the execution result (see below).
+    # The main loop collects it from all agents in the tick and fires SYS
+    # once after the gather — deduplicating multiple threshold trips into
+    # a single audit run. No inline execute_sys (avoids re-entrancy).
 
     # Append log entries
     for entry in log_entries:
@@ -477,6 +485,8 @@ async def check_and_execute(agent_code: str):
         cortex_script.post_execution(
             agent_code, log_entries, consultation_record, wiki_updates
         )
+
+    return {"threshold_tripped": threshold_tripped}
 ```
 
 ### 5.2 Prompt Caching
@@ -1743,7 +1753,7 @@ class TelegramBot:
                 cycle = cycle_manager.get_active_cycle("SG", current)
                 if cycle:
                     cycle.append_turn(text, "OP")
-                    flag_for_execution("SG")
+                    flag_for_execution("SG", cycle_id=cycle.id)
                     await self.send(chat_id, "↩️ Forwarded to SG.")
             else:
                 await self.send(chat_id, "No active exchange. Use /pending.")
@@ -1862,7 +1872,7 @@ class TelegramBot:
                 cycle = cycle_manager.get_active_cycle("SYS", current)
                 if cycle:
                     cycle.append_turn(text, "ADMIN_OP")
-                    flag_for_execution("SYS")
+                    flag_for_execution("SYS", cycle_id=cycle.id)
                     await self.send(chat_id, "↩️ Forwarded to SYS.")
             else:
                 await self.send(chat_id, "No active GOV exchange.")
@@ -2720,7 +2730,7 @@ class MCPServer:
             if cycle:
                 cycle.append_turn(args["message"], role)
                 partner = "SG" if role == "OP" else "SYS"
-                flag_for_execution(partner)
+                flag_for_execution(partner, cycle_id=cycle.id)
                 return f"Message added to {cycle.id}. {partner} will respond."
             return "No active exchange for this artifact."
 
@@ -2955,7 +2965,12 @@ async def main():
     cycle_manager = CycleManager()
     op_backlog = Backlog(OP_BACKLOG_DIR)
     admin_backlog = Backlog(ADMIN_BACKLOG_DIR)
-    router = Router(ROUTING_TABLE)
+    # ROUTING_TABLE is a module-level constant (§4.1).
+    # Router reads it directly; dependencies are injected for I/O operations
+    # (archiving, backlog delivery, notifications, cycle management).
+    router = Router(store=artifact_store, state_dir=STATE_DIR,
+                    op_backlog=op_backlog, admin_backlog=admin_backlog,
+                    telegram_bot=telegram_bot, cycles=cycle_manager)
     telegram_bot = TelegramBot()
     executor = AgentExecutor(wiki_manager, sequence_manager,
                              instance_manager, cycle_manager)
@@ -2989,19 +3004,26 @@ async def main():
                 tasks.append(executor.execute(agent_code))
 
         if tasks:
-            await asyncio.gather(*tasks)
+            execution_results = await asyncio.gather(*tasks)
             execution_count += len(tasks)
+        else:
+            execution_results = []
 
         # 3. SYS scheduling
         if should_run_sys(execution_count):
             await executor.execute_sys()
             wiki_manager.reset_replace_counters()
 
-        # 3a. Wiki replace threshold — checked inline at replace_section time.
-        # When a replace_section call crosses the agent's threshold, the
-        # WikiManager logs the flag and returns True. The executor triggers
-        # SYS immediately from the execution path (no main-loop polling).
-        # See WikiManager.apply_updates → _check_replace_threshold.
+        # 3a. Wiki replace threshold — after-tick dedup.
+        # Each agent execution returns threshold_tripped in its result.
+        # Collect across all results; fire SYS once if any tripped.
+        # This deduplicates multiple threshold crossings into one SYS run
+        # and avoids re-entrancy (SYS doesn't execute inside another agent).
+        if any(r and r.get("threshold_tripped") for r in execution_results):
+            await executor.execute_sys(audit_request=
+                "Wiki replace threshold exceeded. "
+                "Review recent replace_section activity.")
+            wiki_manager.reset_replace_counters()
 
         # 4. CORTEX periodic maintenance (if active)
         if CORTEX_ENABLED and should_run_cortex_maintenance(execution_count):
