@@ -573,25 +573,9 @@ class TelegramBot:
             return
         code = ctx.args[0].upper()
         n = int(ctx.args[1]) if len(ctx.args) > 1 else 10
-        path = Path(self.config.AGENTS_DIR) / code / "wiki" / "log.md"
-        if not path.exists():
-            await self._reply(update, f"No log for {code}")
-            return
-        # WikiManager.append_log writes entries starting with
-        # `## [YYYY-MM-DD HH:MM]` (line-start, bracketed timestamp). Split on
-        # that anchor instead of the bare `\n## ` substring — log content can
-        # contain `## ` naturally (e.g., a WIKI_REPLACE entry that quotes a
-        # new section heading like `## SectionTitle` would mis-split).
-        text = path.read_text()
-        log_entry_re = re.compile(r"(?m)^## \[\d{4}-\d{2}-\d{2}")
-        matches = list(log_entry_re.finditer(text))
-        if not matches:
-            await self._reply(update, text[-3500:] or "(empty log)")
-            return
-        offsets = [m.start() for m in matches] + [len(text)]
-        entries = [text[offsets[i]:offsets[i + 1]] for i in range(len(matches))]
-        recent = entries[-n:]
-        await self._reply(update, "".join(recent)[-3500:])
+        # NEW-3 — shared reader on WikiManager (MCP vega_log uses the same).
+        text = self.wiki.read_log(code, n)
+        await self._reply(update, (text[-3500:] if text else f"No log for {code}"))
 
     async def _cmd_thinking(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not ctx.args:

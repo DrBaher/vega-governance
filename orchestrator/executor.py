@@ -504,6 +504,18 @@ class AgentExecutor:
         all_agents = [c for c in self.config.AGENTS if c != "SYS"]
         all_wikis = self.wiki.read_all_agents(all_agents)
         all_logs = self.wiki.read_all_logs(all_agents)
+
+        # #11 — classify an Admin OP /sys request: a scope-flavored request must
+        # be redirected to OP→SG (PROP→AUTH), not handled as governance. We don't
+        # short-circuit (SYS is the decision-maker) — we annotate the request so
+        # SYS responds with the redirect instead of a UNIVERSAL change.
+        if audit_request and self._classify_sys_request(audit_request) == "scope":
+            audit_request = (
+                "⚠️ AUTHORITY NOTE: this request looks scope-flavored, not "
+                "governance. SYS does not edit scope. Respond by directing the "
+                "requester to submit it via OP→SG (PROP→AUTH); do NOT produce a "
+                "UNIVERSAL change.\n\nOriginal request: " + audit_request)
+
         # NEW-5: SYS gets its §12.3 tiered view (role defs + governance sections,
         # ~20k tokens), not the full framework truncated at 20K.
         framework_text = self._load_framework_view("SYS")
@@ -517,6 +529,18 @@ class AgentExecutor:
             recent_execution_log=recent_execution_log,
             since=since,
         )
+
+        # SC-6 provenance audit (#14, §5.6) — every archived artifact must have a
+        # routing_log entry OR `applied_via: import`. Surface orphans so SYS opens
+        # a GOV for each (a routing-less artifact is an unauthorized injection).
+        orphans = self._provenance_violations(recent_artifacts)
+        if orphans:
+            inbox_content += (
+                "\n\n## ⚠️ PROVENANCE VIOLATIONS (SC-6, §5.6)\n"
+                "These archived artifacts have NO routing_log entry and are NOT "
+                "marked `applied_via: import` — i.e. they entered the archive "
+                "without going through generation→routing. Open a GOV for each:\n"
+                + "\n".join(f"- {o}" for o in orphans))
 
         static_content = self._compose_static(
             wiki_content=wiki_content,
@@ -559,6 +583,28 @@ class AgentExecutor:
         if not (artifacts or wiki_updates or log_entries_parsed) and produced_signal:
             return await self._handle_malformed(agent_code, full_text, [])
         await self._reset_malformed_counter(agent_code)
+
+        # #11 UNIVERSAL Authority Boundary — validate any UNIVERSAL-targeted write
+        # BEFORE applying. On a conflict, the write is dropped and a GOV is routed
+        # to Admin OP (a silent invariant-violating UNIVERSAL write is a backdoor).
+        universal_conflicts = self._validate_universal_invariants(wiki_updates)
+        if universal_conflicts:
+            gov_id = await self.sequences.next_id("SYS", "GOV")
+            gov = Artifact(
+                type="GOV", sender="SYS", recipient="ADMIN_OP", id=gov_id,
+                sender_instance=instance, sender_model=model, priority="P1",
+                content=("UNIVERSAL update BLOCKED — Authority Boundary violation "
+                         "(Framework §3 / Spec §5.6):\n"
+                         + "\n".join(f"- {c}" for c in universal_conflicts)
+                         + "\n\nThe proposed UNIVERSAL change was NOT applied. "
+                         "Review and either re-issue a compliant change or "
+                         "resolve via /resolve."))
+            artifacts.append(gov)
+            self.wiki.append_log(agent_code, LogEntry(
+                "AUTHORITY_BOUNDARY | Blocked UNIVERSAL update(s): "
+                + "; ".join(universal_conflicts)))
+            wiki_updates = [u for u in wiki_updates
+                            if getattr(u, "target", "own") != "universal"]
 
         await self.wiki.apply_updates(agent_code, wiki_updates)
 
@@ -871,6 +917,83 @@ class AgentExecutor:
                                    and header.get("target", "").lower() == "universal") else "own",
         )
 
+    # ─── UNIVERSAL Authority Boundary (#11, Framework §3 / Spec §5.6) ─────────
+
+    # The four invariants SYS may never weaken when writing UNIVERSAL. Each maps
+    # to patterns that signal a violating directive in the proposed update text.
+    _UNIVERSAL_INVARIANTS = (
+        ("agent core responsibilities (§5)", (
+            r"remov\w+.{0,40}(responsib|duty|mandate)",
+            r"reassign\w*.{0,40}(responsib|agent|role)",
+            r"strip\w*.{0,40}(responsib|agent)")),
+        ("V-model gates (§2)", (
+            r"bypass\w*.{0,40}(gate|v-?model|review|validation)",
+            r"skip\w*.{0,40}(gate|review|validation|verification)",
+            r"remov\w*.{0,40}gate")),
+        ("role separation (generation/evaluation)", (
+            r"merg\w*.{0,40}role", r"conflat\w*",
+            r"combin\w*.{0,40}(generat|evaluat|guardian|editor|auditor)")),
+        ("scope protection (PROP→AUTH)", (
+            r"(without|skip\w*|bypass\w*|no\s+need\s+for|remov\w*).{0,40}(prop|auth)",
+            r"weaken\w*.{0,40}scope",
+            r"direct\w*.{0,40}scope.{0,40}(edit|chang)")),
+    )
+
+    def _validate_universal_invariants(self, wiki_updates: list[WikiUpdate]) -> list[str]:
+        """Return a conflict description for every UNIVERSAL-targeted update whose
+        text appears to violate an Authority Boundary invariant (#11). Empty list
+        = clean. Heuristic by design: a flagged update is NOT applied and is
+        surfaced to Admin OP for a human governance call (false positives are
+        cheap — Admin OP can re-issue; a missed violation is a backdoor)."""
+        conflicts: list[str] = []
+        for u in wiki_updates:
+            if getattr(u, "target", "own") != "universal":
+                continue
+            text = (u.content or "").lower()
+            for name, patterns in self._UNIVERSAL_INVARIANTS:
+                if any(re.search(p, text) for p in patterns):
+                    conflicts.append(
+                        f"UNIVERSAL update to '{u.file or '?'}' appears to violate "
+                        f"invariant — {name}.")
+        return conflicts
+
+    def _provenance_violations(self, recent_artifacts: list[Artifact]) -> list[str]:
+        """SC-6 (#14, §5.6) — archived artifacts with NO routing_log entry and NO
+        `applied_via: import` marker. Such an artifact entered the archive without
+        passing through generation→routing, which SYS must flag as a GOV."""
+        log = load_json(self.state_dir / "routing_log.json", default=[])
+        routed_ids = {e.get("artifact_id") for e in log} if isinstance(log, list) else set()
+        out: list[str] = []
+        for a in recent_artifacts:
+            if not a.id or a.id in routed_ids:
+                continue
+            if getattr(a, "applied_via", None) == "import":
+                continue
+            out.append(f"{a.id} ({a.type} from {a.sender}) — no routing_log entry, "
+                       f"no import marker.")
+        return out
+
+    @staticmethod
+    def _classify_sys_request(audit_request: str) -> str:
+        """Classify an Admin OP /sys request as 'scope' or 'governance' (#11,
+        Spec §5.6). Scope-flavored requests (asking to change WHAT is built) must
+        go OP→SG via PROP→AUTH, not through SYS. Default 'governance'."""
+        if not audit_request:
+            return "governance"
+        t = audit_request.lower()
+        scope_signals = (
+            "add to scope", "remove from scope", "change the scope",
+            "scope should", "the spec should", "requirement", "feature",
+            "add a rule", "edit the scope", "scope doc", "should support",
+            "should include", "should handle", "in scope", "out of scope")
+        gov_signals = (
+            "audit", "governance", "invariant", "consisten", "wiki",
+            "universal", "decision log", "d-arch", "drift", "provenance",
+            "violation", "process", "protocol")
+        s = sum(1 for k in scope_signals if k in t)
+        g = sum(1 for k in gov_signals if k in t)
+        return "scope" if s > g else "governance"
+
     # ─── System prompt + scope loading ───────────────────────────────────────
 
     def _load_system_prompt(self, agent_code: str) -> str:
@@ -888,9 +1011,49 @@ class AgentExecutor:
             )
         return path.read_text()
 
+    # SC-5 scope tiers (#13, addendum "Scope Document Classification"):
+    #   FULL_CORPUS  — spec + management docs (SG/SYS need the whole picture)
+    #   SPEC_TIER    — spec docs only (auditors/summary agents; management excluded)
+    #   TASK_SCOPED  — only the docs an inbox SCN/TCN targets, plus the manifest
+    SCOPE_FULL_CORPUS = {"SG", "SYS"}
+    SCOPE_SPEC_TIER = {"SA", "TG", "TA", "BR", "BTA"}
+    SCOPE_TASK_SCOPED = {"SE", "TE"}
+
+    def _load_scope_classification(self) -> dict[str, str]:
+        """Parse the addendum's `## Scope Document Classification` block into
+        {doc_name: 'spec'|'management'} (#13, SC-5). Tolerant of formatting
+        variation; returns {} on any parse failure so callers fall back to the
+        budget-only ordering. Lines look like `- spec: Foo_v1.md` or
+        `Foo_v1.md — management` or a `| doc | spec |` table row."""
+        framework_dir = (self.config.BASE_DIR / "framework"
+                         if hasattr(self.config, "BASE_DIR") else None)
+        if framework_dir is None or not framework_dir.exists():
+            return {}
+        out: dict[str, str] = {}
+        for path in sorted(framework_dir.glob("VEGA_*_Project_Addendum.md")):
+            try:
+                text = path.read_text()
+            except OSError:
+                continue
+            m = re.search(r"(?ims)^#+\s*Scope Document Classification\s*\n(.*?)"
+                          r"(?=^#+\s|\Z)", text)
+            if not m:
+                continue
+            block = m.group(1)
+            for line in block.splitlines():
+                low = line.lower()
+                cls = ("spec" if "spec" in low else
+                       "management" if ("management" in low or "mgmt" in low) else None)
+                if not cls:
+                    continue
+                for doc in re.findall(r"([\w./-]+\.(?:md|txt|csv))", line):
+                    out[doc.rsplit("/", 1)[-1]] = cls
+        return out
+
     def _load_scope(self, agent_code: str, items=None) -> str:
-        # Agents with scope read access per Spec §3.2
-        SCOPE_READERS = {"SG", "SA", "SE", "TG", "TA", "BR", "SYS"}
+        # Agents with scope read access per Spec §3.2 (union of the SC-5 tiers).
+        SCOPE_READERS = (self.SCOPE_FULL_CORPUS | self.SCOPE_SPEC_TIER
+                         | self.SCOPE_TASK_SCOPED)
         if agent_code not in SCOPE_READERS or not self.scope_dir.exists():
             return ""
         docs: list[tuple[str, str, int]] = []
@@ -904,6 +1067,31 @@ class AgentExecutor:
         if not docs:
             return ""
 
+        classification = self._load_scope_classification()
+
+        def _cls(name: str) -> str:
+            return classification.get(name.rsplit("/", 1)[-1], "unknown")
+
+        # SC-5 tier filtering — only when a classification block exists (else we
+        # keep the legacy budget-only behavior so unclassified deployments are
+        # unaffected). SPEC_TIER agents drop explicit management docs.
+        if classification and agent_code in self.SCOPE_SPEC_TIER:
+            docs = [d for d in docs if _cls(d[0]) != "management"]
+            if not docs:
+                return ""
+
+        mentioned = _scope_mentions(items, [n for n, _, _ in docs])
+
+        # TASK_SCOPED (SE/TE): load ONLY the docs an inbox SCN/TCN targets, plus a
+        # manifest of the full corpus. They edit against a specific change, not
+        # the whole spec (#13 / addendum task-scoped tier).
+        if agent_code in self.SCOPE_TASK_SCOPED:
+            selected = [(n, t) for n, t, _ in docs if n in mentioned]
+            loaded = {n for n, _ in selected}
+            manifest = self._scope_manifest(docs, loaded)
+            body = "\n\n".join(f"## {n}\n{t}" for n, t in selected)
+            return manifest + ("\n\n" + body if body else "")
+
         total = sum(sz for _, _, sz in docs)
         # Budget = a fraction of this agent's model window, reserving the rest for
         # system prompt + wiki + framework + inbox + references + output.
@@ -915,13 +1103,15 @@ class AgentExecutor:
             # Fits comfortably (e.g. guardians on a 1M window) — load the lot.
             return "\n\n".join(f"## {n}\n{t}" for n, t, _ in docs)
 
-        # Per-agent scoping (B): relevant docs first, then smallest-first to fit;
-        # always prepend a manifest of the FULL corpus so the agent knows what
-        # exists and can flag if it needs an omitted doc.
-        mentioned = _scope_mentions(items, [n for n, _, _ in docs])
-        order = ([d for d in docs if d[0] in mentioned]
-                 + sorted((d for d in docs if d[0] not in mentioned),
-                          key=lambda d: d[2]))
+        # Per-agent scoping (B): priority order is (classification tier, inbox
+        # relevance, size) — spec docs load BEFORE management within budget (#13),
+        # mentioned docs ahead of the rest, smallest-first to fit the most.
+        tier_rank = {"spec": 0, "management": 1, "unknown": 2}
+
+        def _key(d):
+            return (tier_rank.get(_cls(d[0]), 2), d[0] not in mentioned, d[2])
+
+        order = sorted(docs, key=_key)
         selected: list[tuple[str, str]] = []
         used = 0
         for n, t, sz in order:
@@ -930,7 +1120,13 @@ class AgentExecutor:
             selected.append((n, t))
             used += sz
         loaded = {n for n, _ in selected}
-        manifest = (
+        manifest = self._scope_manifest(docs, loaded)
+        body = "\n\n".join(f"## {n}\n{t}" for n, t in selected)
+        return manifest + "\n\n" + body
+
+    @staticmethod
+    def _scope_manifest(docs: list[tuple[str, str, int]], loaded: set[str]) -> str:
+        return (
             "## SCOPE MANIFEST — full corpus catalogue. [loaded] docs appear below "
             "in full; [omitted] are available — ask OP to inject one (or it's "
             "loaded when an artifact you receive references it) if you need it.\n"
@@ -938,8 +1134,6 @@ class AgentExecutor:
                 f"- {'[loaded]' if n in loaded else '[omitted]'} {n} "
                 f"(~{sz // 1000}k chars) — {_first_heading(t)}"
                 for n, t, sz in docs))
-        body = "\n\n".join(f"## {n}\n{t}" for n, t in selected)
-        return manifest + "\n\n" + body
 
     def _load_framework_view(self, agent_code: str) -> str:
         """Framework v5 §12 + Spec v4 §5.3 — return the tiered view for this

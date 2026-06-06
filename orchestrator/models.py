@@ -94,6 +94,7 @@ class Artifact:
     disposition: str | None = None             # AUTH only: approve | reject | modify
     modifications: str | None = None           # AUTH modify only
     certificate: str | None = None             # VAL only: full | build (test lane; "second" = legacy alias for build)
+    applied_via: str | None = None             # SC-6: "import" for pre-orchestrator/bootstrap artifacts (no routing_log entry)
     filename: str | None = None                # set by ArtifactStore when persisted
 
     def to_markdown(self) -> str:
@@ -112,6 +113,7 @@ class Artifact:
         if self.disposition: meta["disposition"] = self.disposition
         if self.modifications: meta["modifications"] = self.modifications
         if self.certificate: meta["certificate"] = self.certificate
+        if self.applied_via: meta["applied_via"] = self.applied_via
         meta["status"] = self.status
         return _emit_frontmatter(meta, self.content)
 
@@ -137,6 +139,7 @@ class Artifact:
             disposition=meta.get("disposition"),
             modifications=meta.get("modifications"),
             certificate=meta.get("certificate"),
+            applied_via=meta.get("applied_via"),
             filename=filename,
         )
 

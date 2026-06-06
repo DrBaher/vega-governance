@@ -454,19 +454,8 @@ class MCPTools:
         return {p.name: p.stat().st_size for p in sorted(wiki_dir.glob("*.md"))}
 
     async def vega_log(self, code: str, n: int = 10) -> str:
-        code = code.upper()
-        path = Path(self.config.AGENTS_DIR) / code / "wiki" / "log.md"
-        if not path.exists():
-            return ""
-        import re
-        text = path.read_text()
-        log_entry_re = re.compile(r"(?m)^## \[\d{4}-\d{2}-\d{2}")
-        matches = list(log_entry_re.finditer(text))
-        if not matches:
-            return text[-3500:]
-        offsets = [m.start() for m in matches] + [len(text)]
-        entries = [text[offsets[i]:offsets[i + 1]] for i in range(len(matches))]
-        return "".join(entries[-n:])
+        # NEW-3 — shared log reader on WikiManager (Telegram /log uses the same).
+        return self.wiki.read_log(code, n)
 
     async def vega_scope(self, doc: str = "") -> Any:
         """Read scope documents directly from scope/ (Spec §12.3, SC-3) — no agent

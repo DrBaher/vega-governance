@@ -108,11 +108,11 @@ def load_framework_view(framework_text: str, agent_code: str,
                         addendum_text: str = "") -> str:
     """Return the tiered framework context for `agent_code`.
 
-    Framework v5 §12. Empty string for the minimal tier. Guardians (SG/TG)
-    additionally receive the Project Addendum (per §12.2): SG always, TG only
-    if the project's test decomposition needs domain context — at the
-    framework level we pass it for both and let the agent ignore irrelevant
-    parts (cheaper than per-project conditional loading).
+    Framework v5 §12. Empty string for the minimal tier. Every non-minimal
+    tier receives the Project Addendum (#12, Spec §5.3 + §12): guardians, the
+    summary tier (SA/TA/BR/BTA), and SYS all need project context to reason —
+    only SE/TE (minimal) work purely from the SCN/TCN they're handed. Agents
+    ignore addendum parts irrelevant to them (cheaper than per-role filtering).
     """
     tier = AGENT_TIER.get(agent_code, "summary")
     sections = TIER_SECTIONS.get(tier, [])
@@ -121,7 +121,7 @@ def load_framework_view(framework_text: str, agent_code: str,
         body = extract_section(framework_text, sec)
         if body:
             chunks.append(body)
-    if tier == "guardian" and addendum_text:
+    if tier != "minimal" and addendum_text:
         chunks.append(f"## Project Addendum\n{addendum_text}")
     return "\n\n".join(chunks)
 

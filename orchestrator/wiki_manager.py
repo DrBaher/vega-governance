@@ -351,6 +351,24 @@ class WikiManager:
         line = f"## [{ts}] {instance} ({model}) | {entry.content.rstrip()}\n"
         atomic_append(self.agents_dir / agent_code / "wiki" / "log.md", line)
 
+    def read_log(self, agent_code: str, n: int = 10) -> str:
+        """Return the last `n` log entries from an agent's wiki/log.md (NEW-3 —
+        shared by Telegram /log and MCP vega_log so both stay in sync). An entry
+        starts at a `## [YYYY-MM-DD ...]` header; if no headers parse (legacy
+        free-form logs), fall back to the trailing slice."""
+        import re
+        path = self.agents_dir / agent_code.upper() / "wiki" / "log.md"
+        if not path.exists():
+            return ""
+        text = path.read_text()
+        entry_re = re.compile(r"(?m)^## \[\d{4}-\d{2}-\d{2}")
+        matches = list(entry_re.finditer(text))
+        if not matches:
+            return text[-3500:]
+        offsets = [m.start() for m in matches] + [len(text)]
+        entries = [text[offsets[i]:offsets[i + 1]] for i in range(len(matches))]
+        return "".join(entries[-n:])
+
     # ─── Replace threshold tracking ──────────────────────────────────────────
 
     async def _bump_replace_counter(self, agent_code: str) -> bool:

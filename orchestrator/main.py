@@ -538,6 +538,7 @@ def _place_initial_input(cfg, initial_input_path: str) -> None:
         content=path.read_text(),
         id="INIT-OP-001",
         timestamp=utcnow_iso(),
+        applied_via="import",   # SC-6 — bootstrap artifact, never routed (§7.4/§14)
     )
     store = ArtifactStore(cfg.AGENTS_DIR, cfg.ARTIFACTS_DIR)
     store.archive_artifact(artifact)        # Spec §14 lines 2486-2488 (NEW-12)
@@ -583,6 +584,42 @@ def _generate_system_prompts() -> None:
         print(f"[init] Wrote {path}")
 
 
+# ─── Emergency import (SC-6, Spec §5.6) ──────────────────────────────────────
+
+async def import_artifact(path: str, artifact_type: str = "DOC",
+                          sender: str = "OP") -> str:
+    """Admin OP emergency import (SC-6, §5.6 line 1091). Archive a pre-existing
+    document as an artifact carrying `applied_via: import` (so the SYS provenance
+    audit recognizes it as a sanctioned bypass, not an orphan), then auto-route a
+    GOV-SYS to Admin OP so the bypass is acknowledged through governance."""
+    src = Path(path)
+    if not src.exists():
+        raise FileNotFoundError(path)
+    orch = Orchestrator()
+    artifact_id = await orch.sequences.next_id(sender, artifact_type)
+    imported = Artifact(
+        type=artifact_type, sender=sender, content=src.read_text(),
+        id=artifact_id, timestamp=utcnow_iso(), applied_via="import",
+    )
+    # Archive DIRECTLY (not via the router) — an import has no routing_log entry
+    # by definition; the applied_via marker is what authorizes that absence.
+    orch.store.archive_artifact(imported)
+    # Acknowledge the bypass through governance.
+    gov_id = await orch.sequences.next_id("SYS", "GOV")
+    gov = Artifact(
+        type="GOV", sender="SYS", recipient="ADMIN_OP", id=gov_id,
+        timestamp=utcnow_iso(), priority="P1",
+        content=(f"IMPORT ACKNOWLEDGEMENT — artifact {artifact_id} ({artifact_type} "
+                 f"from {sender}) was imported via the emergency CLI with "
+                 f"`applied_via: import`. It bypassed the normal generation→"
+                 f"routing path. Confirm this bypass was authorized (/resolve), "
+                 f"or investigate. Source: {src.name}"))
+    await orch.router.route(gov)
+    print(f"[import] Archived {artifact_id} (applied_via=import); "
+          f"routed {gov_id} to Admin OP for acknowledgement.")
+    return artifact_id
+
+
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 async def _amain() -> None:
@@ -591,12 +628,20 @@ async def _amain() -> None:
     parser.add_argument("--sys", action="store_true", help="Run SYS once and exit")
     parser.add_argument("--audit-request", help="Optional audit instruction for --sys")
     parser.add_argument("--init-only", action="store_true", help="Run initialize_project and exit")
+    parser.add_argument("--import-artifact", help="Emergency import a document as an "
+                        "artifact (applied_via=import) + route a GOV ack (SC-6)")
+    parser.add_argument("--import-type", default="DOC", help="Artifact type for --import-artifact")
+    parser.add_argument("--import-sender", default="OP", help="Sender for --import-artifact")
     args = parser.parse_args()
 
     if args.bootstrap or args.init_only:
         initialize_project(args.bootstrap)
         if args.init_only:
             return
+
+    if args.import_artifact:
+        await import_artifact(args.import_artifact, args.import_type, args.import_sender)
+        return
 
     orch = Orchestrator()
 

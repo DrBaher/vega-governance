@@ -192,6 +192,7 @@ async def test_execute_sys_malformed_on_thinking_only(tmp_path):
     ex._load_framework = lambda: ""
     ex.store = MagicMock()
     ex.store.get_recent_artifacts.return_value = []
+    ex.state_dir = Path("/nonexistent-vega-test")   # SC-6 provenance check reads routing_log
     ex._load_recent_execution_log = lambda since=None: []
     ex.models = MagicMock(); ex.models.get.return_value = "claude-opus-4-7"
     ex.instances = MagicMock(); ex.instances.get_or_create.return_value = "SYS-S001"
