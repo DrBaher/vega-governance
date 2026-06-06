@@ -295,22 +295,23 @@ class AgentExecutor:
             assistant_msg = {"role": "assistant", "content": full_text}
             if user_msg is not None:
                 self.cycles.append_turn(cycle, user_msg, assistant_msg)
-            used = self.cycles.estimate_tokens(cycle.messages)
-            limit = _model_context_limit(model)
-            if limit and used / limit > self.config.CYCLE_CONTEXT_WARNING:
-                # Spec §6.4 — compress early turns and emit the U-RC-08 warning.
-                usage_pct = used / limit
-                compressed = self.cycles.compress_early_turns(cycle)
-                if compressed > 0:
+            # Spec §6.4 (NEW-2) — estimate + compress is encapsulated in
+            # CycleManager; the executor only logs the outcome.
+            status = self.cycles.check_context_usage(
+                cycle, _model_context_limit(model), self.config.CYCLE_CONTEXT_WARNING)
+            if status["over"]:
+                if status["compressed"] > 0:
                     self.wiki.append_log(agent_code, LogEntry(
-                        f"CYCLE_COMPRESSION | {cycle.id} | Context at {usage_pct:.0%}, "
-                        f"compressed early turns (U-RC-08 warning: verify post-compression)"
+                        f"CYCLE_COMPRESSION | {cycle.id} | Context at "
+                        f"{status['usage_pct']:.0%}, compressed early turns "
+                        f"(U-RC-08 warning: verify post-compression)"
                     ))
                 else:
                     # Not enough turns to compress yet; just warn.
                     self.wiki.append_log(agent_code, LogEntry(
-                        f"CYCLE_CONTEXT_WARNING | {cycle.id} | Context at {usage_pct:.0%} "
-                        f"({used}/{limit}) — too few turns to compress yet"
+                        f"CYCLE_CONTEXT_WARNING | {cycle.id} | Context at "
+                        f"{status['usage_pct']:.0%} ({status['used']}/{status['limit']}) "
+                        f"— too few turns to compress yet"
                     ))
 
         # Build consultation record
@@ -443,16 +444,14 @@ class AgentExecutor:
         # conversational text when present, else the full text (so a turn that
         # only emits artifacts still records *something* in the dialogue).
         self.cycles.append_assistant_turn(cycle, conversational or full_text)
-        used = self.cycles.estimate_tokens(cycle.messages)
-        limit = _model_context_limit(model)
-        if limit and used / limit > self.config.CYCLE_CONTEXT_WARNING:
-            usage_pct = used / limit
-            compressed = self.cycles.compress_early_turns(cycle)
-            if compressed > 0:
-                self.wiki.append_log(agent_code, LogEntry(
-                    f"CYCLE_COMPRESSION | {cycle.id} | Context at {usage_pct:.0%}, "
-                    f"compressed early turns (U-RC-08 warning: verify post-compression)"
-                ))
+        status = self.cycles.check_context_usage(
+            cycle, _model_context_limit(model), self.config.CYCLE_CONTEXT_WARNING)
+        if status["over"] and status["compressed"] > 0:
+            self.wiki.append_log(agent_code, LogEntry(
+                f"CYCLE_COMPRESSION | {cycle.id} | Context at "
+                f"{status['usage_pct']:.0%}, compressed early turns "
+                f"(U-RC-08 warning: verify post-compression)"
+            ))
 
         for artifact in artifacts:
             self.store.outbox(agent_code).place(artifact)

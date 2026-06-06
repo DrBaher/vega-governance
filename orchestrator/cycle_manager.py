@@ -441,6 +441,22 @@ class CycleManager:
                 self.close_cycle(cycle)
                 return
 
+    def check_context_usage(self, cycle: Cycle, model_limit: int | None,
+                            warning_fraction: float) -> dict:
+        """NEW-2 / Spec §6.4 — estimate a cycle's context use and, if it exceeds
+        `warning_fraction` of the model window, compress early turns. Returns a
+        status dict so the caller (which owns the wiki) does the logging:
+        {over, used, limit, usage_pct, compressed}. Encapsulates the estimate +
+        threshold + compress logic that was duplicated inline in the executor."""
+        used = self.estimate_tokens(cycle.messages)
+        usage_pct = (used / model_limit) if model_limit else 0.0
+        if not model_limit or usage_pct <= warning_fraction:
+            return {"over": False, "used": used, "limit": model_limit,
+                    "usage_pct": usage_pct, "compressed": 0}
+        compressed = self.compress_early_turns(cycle)
+        return {"over": True, "used": used, "limit": model_limit,
+                "usage_pct": usage_pct, "compressed": compressed}
+
     def estimate_tokens(self, messages: list[dict]) -> int:
         """Cheap heuristic: 1 token ≈ 4 chars. Used for the 40% warning."""
         total = 0

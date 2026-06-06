@@ -239,6 +239,51 @@ def test_execute_sys_wires_provenance_audit():
     assert "PROVENANCE VIOLATIONS" in src
 
 
+# ─── NEW-2 CycleManager.check_context_usage ──────────────────────────────────
+
+def test_check_context_usage_under_threshold(tmp_path):
+    from cycle_manager import CycleManager
+    cm = CycleManager(tmp_path / "cycles", tmp_path / "archive")
+    cycle = cm.open_cycle("prop_exchange",
+                          Artifact(type="PROP", sender="SG", content="x", id="PROP-SG-001"),
+                          ["SG", "OP"], primary_agent="SG")
+    cm.append_turn(cycle, "short", "OP")
+    status = cm.check_context_usage(cycle, model_limit=1_000_000, warning_fraction=0.4)
+    assert status["over"] is False and status["compressed"] == 0
+
+
+def test_check_context_usage_compresses_over_threshold(tmp_path):
+    from cycle_manager import CycleManager
+    cm = CycleManager(tmp_path / "cycles", tmp_path / "archive")
+    cycle = cm.open_cycle("prop_exchange",
+                          Artifact(type="PROP", sender="SG", content="x", id="PROP-SG-001"),
+                          ["SG", "OP"], primary_agent="SG")
+    for i in range(20):
+        cm.append_turn(cycle, "word " * 500, "OP")   # bloat the context
+    # tiny window so estimate easily exceeds 40%
+    status = cm.check_context_usage(cycle, model_limit=2000, warning_fraction=0.4)
+    assert status["over"] is True
+    assert status["usage_pct"] > 0.4
+
+
+def test_check_context_usage_no_limit(tmp_path):
+    from cycle_manager import CycleManager
+    cm = CycleManager(tmp_path / "cycles", tmp_path / "archive")
+    cycle = cm.open_cycle("prop_exchange",
+                          Artifact(type="PROP", sender="SG", content="x", id="PROP-SG-001"),
+                          ["SG", "OP"], primary_agent="SG")
+    cm.append_turn(cycle, "anything", "OP")
+    status = cm.check_context_usage(cycle, model_limit=None, warning_fraction=0.4)
+    assert status["over"] is False
+
+
+def test_executor_uses_check_context_usage():
+    src = (Path(__file__).resolve().parent.parent / "executor.py").read_text()
+    assert "self.cycles.check_context_usage(" in src
+    # the old inline estimate/compress dance is gone from the executor
+    assert "self.cycles.compress_early_turns(cycle)" not in src
+
+
 # ─── NEW-3 WikiManager.read_log shared ───────────────────────────────────────
 
 def test_wiki_read_log(tmp_path):
