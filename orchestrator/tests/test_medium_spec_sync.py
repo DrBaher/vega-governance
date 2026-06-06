@@ -91,6 +91,16 @@ async def test_vega_scope_single_doc(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_vega_scope_rejects_traversal(tmp_path):
+    tools, _, _, cfg, _ = _make_tools(tmp_path)
+    scope = Path(cfg.SCOPE_DIR); scope.mkdir(parents=True)
+    (scope / "Scope_v1.md").write_text("ok")
+    for bad in ("../../etc/passwd", "/etc/passwd", "~/secret"):
+        r = await tools.vega_scope(bad)
+        assert r["found"] is False and r.get("content") is None
+
+
+@pytest.mark.asyncio
 async def test_vega_scope_no_dir(tmp_path):
     tools, _, _, _, _ = _make_tools(tmp_path)   # SCOPE_DIR not created
     assert await tools.vega_scope() == []

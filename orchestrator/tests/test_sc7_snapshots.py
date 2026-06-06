@@ -291,6 +291,24 @@ def test_cancel_restore(tmp_path):
     assert not rm.has_pending_restore("admin-chat")
 
 
+def test_op_can_reject_restore_consent(tmp_path):
+    """§7.5 'either can block' — once OP consent is pending, REJECT cancels it so
+    confirm_restore_op can no longer return the snapshot id."""
+    rm = _rm_with_op(tmp_path)
+    rm.initiate_restore("admin-chat", "SNAP-1")
+    op_id, _ = rm.confirm_restore_admin("admin-chat")   # → OP consent pending
+    assert rm.has_pending_restore(op_id)
+    rm.cancel_restore(op_id)                              # OP types REJECT
+    assert not rm.has_pending_restore(op_id)
+    assert rm.confirm_restore_op(op_id) is None          # consent no longer possible
+
+
+def test_reject_path_wired_in_on_text():
+    src = (Path(__file__).resolve().parent.parent / "telegram_bot.py").read_text()
+    assert 'is_reject = text.strip().upper() == "REJECT"' in src
+    assert "rm.cancel_restore(chat_id)" in src
+
+
 # ─── contract: snapshot on approve only, wired into process_disposition ──────
 
 def test_process_disposition_snapshots_on_approve_only():

@@ -974,7 +974,17 @@ class TelegramBot:
         text = update.message.text or ""
         chat_id = update.effective_chat.id
         is_approve = text.strip().upper() == "APPROVE"
+        is_reject = text.strip().upper() == "REJECT"
         rm = self.role_manager
+
+        # "REJECT" blocks a pending dual-2FA restore (§7.5 — "either can block").
+        # Works for the Admin OP (phase 1) and the OP consent step (phase 2).
+        if is_reject and rm is not None and rm.has_pending_restore(chat_id):
+            rm.cancel_restore(chat_id)
+            rm._log_event("restore_rejected", actor_telegram_id=str(chat_id),
+                          result="blocked")
+            await self._reply(update, "🛑 Restore blocked. No scope was changed.")
+            return
 
         # Admin OP: "APPROVE" confirms a pending action. Restore (SC-7 §7.5)
         # takes precedence over a role action — both can't be pending at once,
@@ -1122,7 +1132,7 @@ class TelegramBot:
         await self._reply(update,
             f"⚠️ Restore to `{snap_id}` — technical-authority 2FA code *{otp}*.\n"
             f"Reply `APPROVE` (or enter the code) to confirm; OP scope-authority "
-            f"consent will then be requested.")
+            f"consent will then be requested. Reply `REJECT` to abort.")
 
     async def _confirm_restore_admin(self, update: Update, chat_id) -> None:
         """Phase 1 confirmed → request OP scope-authority consent (phase 2)."""
@@ -1133,7 +1143,8 @@ class TelegramBot:
         op_telegram_id, op_otp = result
         await self.send(
             f"⚠️ Admin OP requests scope restoration. Scope-authority 2FA code *{op_otp}*.\n"
-            f"Reply `APPROVE` (or enter the code) to consent — this replaces the live scope.",
+            f"Reply `APPROVE` (or enter the code) to consent — this replaces the live "
+            f"scope — or `REJECT` to block it.",
             chat_id=op_telegram_id)
         await self._reply(update,
             "✅ Technical authority confirmed. OP scope-authority consent requested — "

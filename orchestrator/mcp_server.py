@@ -468,7 +468,12 @@ class MCPTools:
         if not scope_dir.exists():
             return [] if not doc else {"doc": doc, "found": False, "content": None}
         if doc:
-            # Resolve by exact name or filename stem; never escape scope/.
+            # Path-traversal safety (audit item 6): reject any traversal/absolute
+            # input outright. Resolution is by name match against scope_dir's own
+            # glob, so an escaping path can never resolve — this is belt-and-braces.
+            if ".." in doc or doc.startswith("/") or doc.startswith("~"):
+                return {"doc": doc, "found": False, "content": None,
+                        "error": "invalid document name"}
             candidates = [p for p in scope_dir.glob("*.md")
                           if p.name == doc or p.stem == doc or p.name == f"{doc}.md"]
             if not candidates:
