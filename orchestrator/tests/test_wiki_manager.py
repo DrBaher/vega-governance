@@ -70,10 +70,13 @@ async def test_replace_threshold_triggers(tmp_path):
             section="Rule 1", content="x", justification="y",
         )])
         tripped = result or tripped
+    # The inline trigger is apply_updates returning True (D3 cleanup removed the
+    # old any_threshold_exceeded poll). reset_replace_counters clears the state.
     assert tripped is True
-    assert wm.any_threshold_exceeded() is True
+    from state_manager import load_json
+    assert load_json(wm.counters_file, default={}).get("SG", 0) >= 3
     wm.reset_replace_counters()
-    assert wm.any_threshold_exceeded() is False
+    assert load_json(wm.counters_file, default={}) == {}
 
 
 def test_exclusion_filter(tmp_path):

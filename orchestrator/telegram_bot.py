@@ -71,7 +71,6 @@ class TelegramBot:
         models_mgr: ModelAssignmentManager,
         sequences: SequenceManager,
         sys_trigger: Callable[[Optional[str]], Awaitable[Any]],
-        agent_retry: Callable[[str], Awaitable[Any]],
         agent_pause: Callable[[str], None],
         agent_resume: Callable[[str], None],
         state_dir: str | Path,
@@ -85,7 +84,6 @@ class TelegramBot:
         self.models = models_mgr
         self.sequences = sequences   # Spec §7.2 — AUTH IDs via SequenceManager, not string splicing
         self.sys_trigger = sys_trigger
-        self.agent_retry = agent_retry
         self.agent_pause = agent_pause
         self.agent_resume = agent_resume
         self.state_dir = Path(state_dir)
@@ -630,14 +628,16 @@ class TelegramBot:
         await self._reply(update, f"{code} rotated → {new_id}")
 
     async def _cmd_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Run an agent now against its inbox (Spec §11, replaces /retry)."""
+        """Queue an agent for a normal inbox pass on the next tick (Spec §11,
+        replaces /retry). Uses flag_for_execution WITHOUT a cycle_id (D3)."""
         if not await self._authorize(update, {"ADMIN_OP"}):
             return
         if not ctx.args:
             await self._reply(update, "Usage: `/run <CODE>`")
             return
-        await self.agent_retry(ctx.args[0].upper())
-        await self._reply(update, f"▶️ Ran {ctx.args[0].upper()}.")
+        code = ctx.args[0].upper()
+        flag_for_execution(self.state_dir, code)
+        await self._reply(update, f"▶️ Queued {code} for execution.")
 
     async def _cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update, {"ADMIN_OP"}):

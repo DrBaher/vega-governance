@@ -165,7 +165,7 @@ def _make_mcptools(tmp_path):
     tools = MCPTools(
         config=_Cfg(), op_backlog=op_backlog, store=store, cycles=cycles,
         wiki=None, instances=None, models_mgr=None, sequences=sequences,
-        sys_trigger=None, agent_retry=None, agent_pause=None, agent_resume=None,
+        sys_trigger=None, agent_pause=None, agent_resume=None,
         process_disposition=None, state_dir=state_dir, router=router,
         admin_backlog=admin_backlog,
     )

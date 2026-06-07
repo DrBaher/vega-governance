@@ -32,7 +32,7 @@ class _Cfg:
         self.PROJECT_NAME = "TEST"
 
 
-def _make_tools(tmp_path: Path, agent_retry=None):
+def _make_tools(tmp_path: Path):
     from mcp_server import MCPTools
     cfg = _Cfg(tmp_path)
     agents_dir = tmp_path / "agents"
@@ -47,18 +47,13 @@ def _make_tools(tmp_path: Path, agent_retry=None):
     async def _noop(*a, **k):
         return None
 
-    calls: list[str] = []
-
-    async def _retry(code):
-        calls.append(code)
-
     tools = MCPTools(
         config=cfg, op_backlog=None, store=store, cycles=cycles, wiki=None,
         instances=None, models_mgr=None, sequences=None, sys_trigger=_noop,
-        agent_retry=agent_retry or _retry, agent_pause=lambda c: None,
+        agent_pause=lambda c: None,
         agent_resume=lambda c: None, process_disposition=_noop,
         state_dir=state_dir)
-    return tools, store, cycles, cfg, calls
+    return tools, store, cycles, cfg, state_dir
 
 
 # ─── #6 vega_scope ───────────────────────────────────────────────────────────
@@ -200,16 +195,15 @@ async def test_vega_cycles_list_and_detail(tmp_path):
 # ─── #9 /run + vega_run ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_vega_run_calls_retry(tmp_path):
-    ran: list[str] = []
-
-    async def _retry(code):
-        ran.append(code)
-
-    tools, _, _, _, _ = _make_tools(tmp_path, agent_retry=_retry)
+async def test_vega_run_flags_execution(tmp_path):
+    # D3 — vega_run flags the agent for a normal inbox pass (no cycle_id),
+    # the same primitive cycle-turn triggers use.
+    from state_manager import drain_execution_flags
+    tools, _, _, _, state_dir = _make_tools(tmp_path)
     msg = await tools.vega_run("sg")
-    assert ran == ["SG"]
     assert "SG" in msg
+    flags = drain_execution_flags(state_dir)
+    assert {"agent": "SG", "cycle_id": None} in flags
 
 
 def test_vega_run_admin_only_and_registered():
@@ -223,6 +217,9 @@ def test_telegram_run_handler_registered():
     src = (Path(__file__).resolve().parent.parent / "telegram_bot.py").read_text()
     assert 'CommandHandler("run", self._cmd_run)' in src
     assert "async def _cmd_run" in src
+    # D3 — /run flags execution rather than calling a separate agent_retry callback
+    assert "flag_for_execution(self.state_dir, code)" in src
+    assert "self.agent_retry" not in src
 
 
 # ─── #10 TELEGRAM_EXCHANGE_ENABLED gate ──────────────────────────────────────

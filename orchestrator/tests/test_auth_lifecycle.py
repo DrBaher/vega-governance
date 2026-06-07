@@ -134,13 +134,10 @@ async def _build_bot(tmp_path):
     async def _noop_sys(req=None):
         return {"executed": False}
 
-    async def _noop_retry(code):
-        return None
-
     bot = TelegramBot(
         config=cfg, op_backlog=op_backlog, store=store, cycles=cycles,
         wiki=wiki, instances=instances, models_mgr=models, sequences=sequences,
-        sys_trigger=_noop_sys, agent_retry=_noop_retry,
+        sys_trigger=_noop_sys,
         agent_pause=lambda c: None, agent_resume=lambda c: None,
         state_dir=state_dir,
     )

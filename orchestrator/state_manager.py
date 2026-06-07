@@ -92,8 +92,15 @@ def load_json(filepath: str | Path, default: Any = None) -> Any:
 _EXECUTION_FLAGS = "execution_flags.json"
 
 
-def flag_for_execution(state_dir: str | Path, agent: str, cycle_id: str) -> None:
-    """Queue `agent` to run its cycle `cycle_id` on the next tick (Spec §6.4).
+def flag_for_execution(state_dir: str | Path, agent: str,
+                       cycle_id: str | None = None) -> None:
+    """Queue `agent` to run on the next tick. Two use cases (Spec §6.4 / §11):
+
+    1. Cycle-turn trigger — called WITH `cycle_id`: the partner agent runs that
+       cycle's next turn (e.g. an OP↔SG exchange continuation).
+    2. Direct execution (/run) — called WITHOUT `cycle_id`: the agent does a
+       normal inbox pass. The agent doesn't need to know why it was flagged;
+       `cycle_id` is operational tracing only.
 
     Safe to call repeatedly — duplicate (agent, cycle_id) pairs are collapsed.
     Single event loop → the load-modify-write below has no await and cannot

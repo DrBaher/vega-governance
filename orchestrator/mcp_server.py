@@ -76,7 +76,6 @@ class MCPTools:
         models_mgr: ModelAssignmentManager,
         sequences: SequenceManager,
         sys_trigger: Callable[[Optional[str]], Awaitable[Any]],
-        agent_retry: Callable[[str], Awaitable[Any]],
         agent_pause: Callable[[str], None],
         agent_resume: Callable[[str], None],
         process_disposition: Callable[..., Awaitable[str]],
@@ -99,7 +98,6 @@ class MCPTools:
         self.models = models_mgr
         self.sequences = sequences
         self.sys_trigger = sys_trigger
-        self.agent_retry = agent_retry
         self.agent_pause = agent_pause
         self.agent_resume = agent_resume
         self.process_disposition = process_disposition
@@ -497,11 +495,11 @@ class MCPTools:
     # ─── Control ────────────────────────────────────────────────────────────
 
     async def vega_run(self, code: str) -> str:
-        """Admin OP — run an agent immediately against its inbox (Spec §11,
-        replaces the old /retry). The orchestrator's run primitive executes the
-        agent now if it has unprocessed inbox items."""
-        await self.agent_retry(code.upper())
-        return f"ran {code.upper()}"
+        """Admin OP — queue an agent for a normal inbox pass on the next tick
+        (Spec §11, replaces the old /retry). Same primitive as a cycle-turn
+        trigger, called WITHOUT a cycle_id (D3): flag_for_execution(code)."""
+        flag_for_execution(self.state_dir, code.upper())
+        return f"queued {code.upper()} for execution"
 
     async def vega_pause(self, code: str) -> str:
         self.agent_pause(code.upper())

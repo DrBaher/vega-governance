@@ -127,7 +127,6 @@ class Orchestrator:
             models_mgr=self.models,
             sequences=self.sequences,   # Spec §7.2 — AUTH minted via SequenceManager
             sys_trigger=self.executor.execute_sys,
-            agent_retry=self._retry_agent,
             agent_pause=self._pause_agent,
             agent_resume=self._resume_agent,
             state_dir=config.STATE_DIR,
@@ -201,7 +200,6 @@ class Orchestrator:
                     models_mgr=self.models,
                     sequences=self.sequences,
                     sys_trigger=self.executor.execute_sys,
-                    agent_retry=self._retry_agent,
                     agent_pause=self._pause_agent,
                     agent_resume=self._resume_agent,
                     process_disposition=self.bot.process_disposition,
@@ -318,21 +316,22 @@ class Orchestrator:
                             )
                             self.paused_agents.add(agent)
 
-        # 2b. Cycle-internal exchange turns (Spec §6.4 / audit P1-2).
-        # Freeform OP/Admin-OP turns are appended to a cycle and the partner agent
-        # is flagged for execution — no artifact, no inbox item. Drain the flags
-        # and run each flagged cycle turn, then relay the agent's reply to OP.
+        # 2b. Drain execution flags (Spec §6.4 / §11 — flag_for_execution's two
+        # use cases). A flag WITH a cycle_id is a cycle-internal exchange turn
+        # (freeform OP/Admin-OP message → partner agent responds); a flag WITHOUT
+        # one is a direct /run (vega_run) → a normal inbox pass.
         for flag in drain_execution_flags(config.STATE_DIR):
             agent_code = flag.get("agent")
             cycle_id = flag.get("cycle_id")
-            if not agent_code or not cycle_id:
-                continue
-            if agent_code in self.paused_agents:
+            if not agent_code or agent_code in self.paused_agents:
                 continue
             try:
-                result = await self.executor.execute_cycle_turn(agent_code, cycle_id)
+                if cycle_id:
+                    result = await self.executor.execute_cycle_turn(agent_code, cycle_id)
+                else:
+                    result = await self.executor.execute(agent_code)   # /run inbox pass
             except Exception as e:
-                print(f"[main] cycle turn failed ({agent_code}/{cycle_id}): "
+                print(f"[main] flagged execution failed ({agent_code}/{cycle_id}): "
                       f"{type(e).__name__}: {e}", flush=True)
                 continue
             if isinstance(result, dict):
@@ -341,7 +340,7 @@ class Orchestrator:
                 if result.get("executed"):
                     self._execution_count += 1
                     reply = result.get("response_text")
-                    if reply:
+                    if reply and cycle_id:
                         await self.bot.relay_exchange_reply(agent_code, cycle_id, reply)
 
         # 3. SYS on schedule (Spec §13) or inline wiki-threshold trigger (§5.1+§8).
@@ -450,10 +449,6 @@ class Orchestrator:
 
     def _resume_agent(self, code: str) -> None:
         self.paused_agents.discard(code)
-
-    async def _retry_agent(self, code: str) -> None:
-        if self.store.inbox(code).has_unprocessed():
-            await self.executor.execute(code)
 
 
 def _recipients_for(artifact: Artifact) -> list[str]:

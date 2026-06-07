@@ -396,14 +396,6 @@ class WikiManager:
                 return True
         return False
 
-    def any_threshold_exceeded(self) -> bool:
-        counters = load_json(self.counters_file, default={})
-        for agent_code, count in counters.items():
-            threshold = self.replace_thresholds.get(agent_code, self.replace_threshold_default)
-            if count >= threshold:
-                return True
-        return False
-
     def reset_replace_counters(self) -> None:
         """Called after each SYS run."""
         atomic_save_json(self.counters_file, {})
