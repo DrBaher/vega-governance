@@ -272,10 +272,10 @@ EXT_BUILD_ENABLED = True
 |-------|-------|--------|
 | SG | own wiki, universal/, scope/, framework/ (guardian view §12.2), inbox/ | own wiki, outbox/ |
 | SA | own wiki, universal/, scope/, framework/ (summary §12.1), inbox/ | own wiki, outbox/ |
-| SE | own wiki, universal/, scope/, inbox/ | own wiki, outbox/, scope/ (only via DOC) |
-| TG | own wiki, universal/, scope/, framework/ (guardian view §12.2), inbox/, test_models/full/ | own wiki, outbox/, test_models/full/ |
+| SE | own wiki, universal/, scope/, inbox/ | own wiki, outbox/, scope/ (via DOC→SG VAL→PRO-SCOPE: SE produces modified files in DOC body, SG validates, orchestrator writes to scope/ at PRO-SCOPE routing time) |
+| TG | own wiki, universal/, scope/, framework/ (guardian view §12.2), inbox/, test_models/full/ | own wiki, outbox/ |
 | TA | own wiki, universal/, scope/, framework/ (summary §12.1), inbox/, test_models/full/ | own wiki, outbox/ |
-| TE | own wiki, universal/, inbox/, test_models/full/, test_models/build/ | own wiki, outbox/, test_models/full/, test_models/build/ |
+| TE | own wiki, universal/, inbox/, test_models/full/, test_models/build/ | own wiki, outbox/, test_models/ (via DOC→TG VAL→PRO-TEST: TE produces modified files in DOC body, TG validates, orchestrator writes at PRO-TEST routing time) |
 | BR | own wiki, universal/, scope/, framework/ (summary §12.1), inbox/, test_models/build/ | own wiki, outbox/ |
 | BTA | own wiki, universal/, framework/ (summary §12.1), inbox/, test_models/full/ | own wiki, outbox/ |
 | SYS | ALL wikis (read), universal/, framework/ (SYS view §12.3), artifacts/archive/, ALL log.md, execution_log.json, role_events.jsonl, snapshots/ | own wiki, universal/ (write), outbox/ |
@@ -362,6 +362,52 @@ ROUTING_TABLE = {
 6. If the routing entry has a `backlog` key: copies to the specified backlog directory, sends Telegram notification to the specified role (best-effort — see §10.2). Does NOT deliver to agent inbox.
 7. If no `backlog` key: delivers to agent inbox (`agents/{recipient}/inbox/`). For EXT/DE-bound types: see §12 External Interfaces.
 8. **Unknown routing key** (type+sender not in table): log as governance violation, auto-create GOV with timestamp-based ID (`GOV-SYS-AUTO-<epoch_ms>`) — the AUTO prefix distinguishes from SYS-minted GOV. Route GOV to Admin OP backlog (`admin_backlog`). Do not deliver artifact. SYS can re-issue with a proper sequence ID during its next audit if needed. Auto-generated GOV artifacts remain in the archive permanently (immutable). When SYS re-issues, the new GOV-SYS-NNN references the auto-GOV in its references field.
+9. **PRO-SCOPE and PRO-TEST scope/test file commit.** When routing PRO-SCOPE or PRO-TEST-FULL/PRO-TEST-BUILD, the router extracts the file content from the referenced DOC (archived, immutable) and writes to the target directory (`scope/` for PRO-SCOPE, `test_models/full/` for PRO-TEST-FULL, `test_models/build/` for PRO-TEST-BUILD) using atomic per-file staging. This is the ONLY code path that writes to scope/ or test_models/ — no agent writes directly. `Router.route()` must `await commit_propagation_files(artifact)` before delivering to downstream agent inboxes, so they read the updated files when they execute.
+
+### 4.3 Scope/Test File Commit on Propagation
+
+```python
+async def commit_propagation_files(artifact):
+    """Write scope or test files from the referenced DOC to disk.
+    Called by router.route() BEFORE delivering PRO-SCOPE/PRO-TEST
+    to downstream agent inboxes.
+    
+    Uses write-ahead pattern:
+      Phase 1: write all .incoming files alongside old (old untouched)
+      Phase 2: rename .incoming → live (microsecond swaps)
+      Recovery: .incoming files on disk at startup = interrupted commit.
+               Delete them — DOC is immutable in archive, retry is safe.
+    """
+    if artifact.type == "PRO-SCOPE":
+        target_dir = SCOPE_DIR
+    elif artifact.type == "PRO-TEST-FULL":
+        target_dir = f"{TEST_MODELS_DIR}/full"
+    elif artifact.type == "PRO-TEST-BUILD":
+        target_dir = f"{TEST_MODELS_DIR}/build"
+    else:
+        return
+
+    # Read file content from the referenced DOC (archived, immutable).
+    doc_id = artifact.references[0]
+    doc = artifact_store.load_from_archive(doc_id)
+    files = parse_file_sections(doc.content)  # ### FILE: name → content
+    if not files:
+        log_error("propagation_commit", f"No ### FILE: markers in {doc_id}")
+        return
+
+    # Phase 1: Stage all new files as .incoming (old files untouched)
+    for filename, content in files.items():
+        incoming = f"{target_dir}/{filename}.incoming"
+        atomic_write(incoming, content)
+
+    # Phase 2: Swap all (each os.replace is atomic on same FS)
+    for filename in files:
+        incoming = f"{target_dir}/{filename}.incoming"
+        target = f"{target_dir}/{filename}"
+        os.replace(incoming, target)
+```
+
+**File deletion.** The `### FILE:` format supports add and modify only. Scope/test file deletion is not automated — it requires OP authorization through the normal scope governance path (SCN + AUTH) and Admin OP manual execution at the server level. SYS detects the change on next scope drift audit. Automated deletion with OP confirmation gate is a possible future addition.
 
 ### 4.4 REJ Routing Resolution
 
@@ -376,7 +422,7 @@ def resolve_rej_recipient(artifact):
     return ROUTING_TABLE[routing_key]
 ```
 
-This is the only place the router reads an archived artifact. All other routing is pure table lookup.
+The router reads archived artifacts in two cases: REJ resolution (§4.4) and propagation commit (§4.3). All other routing is pure table lookup.
 
 ---
 
@@ -626,6 +672,26 @@ priority: [P0-P3, if applicable — SG PROP only]
 ref_type: [type of referenced artifact, if this is a REJ]
 ---
 [artifact content]
+
+For DOC artifacts (SE/TE): the artifact body contains the full modified 
+scope/test files that were edited per the SCN/TCN. Each file is delimited 
+by a ### FILE: marker. The orchestrator does NOT write to scope/ at DOC 
+time — the files are validated by SG/TG first.
+
+    ### FILE: [scope_doc_1.md]
+    [full content of modified file]
+    
+    ### FILE: [scope_doc_2.md]
+    [full content of modified file]
+    
+    ### APPLICATION_NOTES
+    [SE's report: items applied, verification checklist results, issues]
+
+For PRO-SCOPE / PRO-TEST artifacts (SG/TG): lightweight propagation 
+signal. References the validated DOC (e.g., references: [DOC-SE-003]).
+Body contains version identifiers and list of changed files for 
+downstream agent context. The orchestrator reads the actual file 
+content from the referenced archived DOC at routing time (§4.3).
 
 ### WIKI_UPDATE
 file: [wiki file to update]
@@ -1034,7 +1100,7 @@ recipient: SG
 timestamp: 2026-05-20T15:45:00Z
 references:
   - PROP-SG-003
-disposition: approve | reject | modify
+disposition: approve | reject
 ---
 [OP's direction and any modifications]
 ```
@@ -1102,7 +1168,7 @@ def archive(artifact: Artifact, thinking_blocks: list = None):
 
 On each scope approval (AUTH with approve disposition), the orchestrator exports an immutable snapshot of the validated state to durable storage outside its working directory.
 
-**Trigger:** Approve handler (`vega_approve` / `/approve`), after AUTH is issued and the cycle closes. One snapshot per approval. Reject and modify do not snapshot. Both MCP and Telegram approve paths trigger the snapshot.
+**Trigger:** Approve handler (`vega_approve` / `/approve`), after AUTH is issued and the cycle closes. One snapshot per approval. Reject does not snapshot. Both MCP and Telegram approve paths trigger the snapshot.
 
 **Contents — scope + triggering artifacts + verification hashes:**
 
@@ -1587,7 +1653,8 @@ class Backlog:
     def resolve(self, artifact_id: str, resolution=None):
         """Resolve a backlog item. Handles items from either pending 
         (quick decision, no discussion) or in_progress (after exchange).
-        For PROP: resolution is AUTH artifact (already routed by handler). 
+        For PROP: resolution is AUTH artifact (approve/reject — already routed 
+        by handler) or text (modify-directed — cycle stays open, SG revises). 
         For GOV: resolution is text (stored with item, SYS reads in 
         cycle archive at next execution)."""
         in_progress = f"{self.base_dir}/in_progress/{artifact_id}.md"
@@ -1631,7 +1698,7 @@ class TelegramBot:
                 f"Reply to discuss, or:\n"
                 f"/approve {artifact.id}\n"
                 f"/reject {artifact.id} [reason]\n"
-                f"/modify {artifact.id} [instructions]"
+                f"/modify {artifact.id} [instructions] — directs SG to revise"
             )
         elif role == "ADMIN_OP":
             actions = (
@@ -1703,11 +1770,19 @@ class TelegramBot:
 
         elif text.startswith("/modify"):
             artifact_id, instructions = self._extract_id_and_text(text)
-            auth = create_auth(artifact_id, "modify", modifications=instructions)
-            await router.route(auth)
-            op_backlog.resolve(artifact_id, auth)
-            cycle_manager.close_by_artifact(artifact_id)
-            await self.send(chat_id, f"✏️ AUTH issued with modifications for {artifact_id}")
+            cycle = cycle_manager.get_active_by_artifact(artifact_id)
+            if cycle:
+                cycle.append_turn(
+                    f"**OP MODIFICATION DIRECTIVE:** {instructions}", "OP")
+                op_backlog.resolve(artifact_id,
+                    resolution=f"modify-directed: {instructions}")
+                flag_for_execution("SG", cycle_id=cycle.id)
+                await self.send(chat_id,
+                    f"↩️ Modification directive sent for {artifact_id}. "
+                    f"SG will produce revised PROP.")
+            else:
+                await self.send(chat_id,
+                    f"No active exchange for {artifact_id}.")
 
         elif text.startswith("/request"):
             content = text[9:].strip()
@@ -1951,7 +2026,7 @@ class TelegramBot:
         elif cmd == "/agent":
             data = format_agent(self._read_agent(args))
         elif cmd == "/history":
-            artifact = artifact_store.load_archived(args)
+            artifact = artifact_store.load_from_archive(args)
             routing = routing_log.get_entries(args)
             data = (f"**{args}**\n\n{artifact.content if artifact else 'Not found'}"
                     f"\n\n---\nRouting: {format_routing(routing)}")
@@ -2339,7 +2414,7 @@ COMMANDS = {
     # SCOPE DECISIONS
     "/approve":  "Usage: /approve [artifact-id] — Approve PROP",
     "/reject":   "Usage: /reject [artifact-id] [reason]",
-    "/modify":   "Usage: /modify [artifact-id] [instructions]",
+    "/modify":   "Usage: /modify [artifact-id] [instructions] — Sends modification directive to SG within the exchange cycle. Does NOT mint AUTH. SG produces revised PROP.",
     "/request":  "Usage: /request [message] — Submit REQ-OP-NNN to SG",
 
     # MONITORING
@@ -2457,8 +2532,8 @@ vega_request_access(name, telegram_id, role, project)  # Request role assignment
 # Scope
 vega_approve(artifact_id)
 vega_reject(artifact_id, reason)
-vega_modify(artifact_id, instructions)
-vega_exchange(artifact_id, message)    # Multi-turn SG↔OP dialogue
+vega_modify(artifact_id, instructions)  # Modification directive — cycle turn, not AUTH
+vega_exchange(artifact_id, message)     # Multi-turn SG↔OP dialogue
 vega_request(message)                   # Submit REQ-OP-NNN to SG
 vega_backlog()                          # Pending PROP items
 vega_scope()                            # List scope docs (SC-3)
@@ -2725,14 +2800,15 @@ class MCPServer:
             return f"Rejected {args['artifact_id']}."
 
         elif tool_name == "vega_modify":
-            mod = create_artifact(type="AUTH", sender="OP",
-                content=f"MODIFY: {args['instructions']}",
-                references=[args["artifact_id"]],
-                disposition="modify")
-            mod.id = await self.sequences.next_id("OP", "AUTH")
-            await self.router.route(mod)
-            # Cycle stays open — SG revises and produces new PROP
-            return f"Modification requested for {args['artifact_id']}."
+            cycle = self.cycles.get_active_by_artifact(args["artifact_id"])
+            if cycle:
+                cycle.append_turn(
+                    f"**OP MODIFICATION DIRECTIVE:** {args['instructions']}", "OP")
+                self.op_backlog.resolve(args["artifact_id"],
+                    resolution=f"modify-directed: {args['instructions']}")
+                flag_for_execution("SG", cycle_id=cycle.id)
+                return f"Modification directive sent for {args['artifact_id']}. SG will produce revised PROP."
+            return f"No active exchange for {args['artifact_id']}."
 
         elif tool_name == "vega_request":
             req = create_artifact(type="REQ", sender="OP", content=args["message"])
