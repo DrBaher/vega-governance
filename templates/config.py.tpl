@@ -61,7 +61,10 @@ THINKING_BUDGET_TOKENS = 10000   # Per execution
 # so repeated calls within the cache TTL pay reduced input cost.
 PROMPT_CACHING_ENABLED = True
 
-MAX_TOKENS = 16000   # Per agent execution (output)
+MAX_TOKENS = 32000   # Per agent execution. Covers extended-thinking + output.
+                     # The executor streams the API call, so this can exceed the
+                     # non-streaming ~21k ceiling. 16000 was too small for Sonnet
+                     # adaptive thinking on complex tasks (thinking ate the budget).
 
 # ─── Polling ─────────────────────────────────────────────────────────────────
 POLL_INTERVAL = 10   # Seconds between inbox checks

@@ -667,7 +667,14 @@ class AgentExecutor:
                     }
                     if thinking is not None:
                         kwargs["thinking"] = thinking
-                    response = await self.client.messages.create(**kwargs)
+                    # Stream the call (not messages.create): the non-streaming
+                    # client rejects max_tokens that may exceed the 10-min limit
+                    # ("Streaming is required…"), which capped usable max_tokens
+                    # below what Sonnet needs for thinking + output on complex
+                    # tasks. get_final_message() returns the same Message shape,
+                    # so _extract_response is unchanged.
+                    async with self.client.messages.stream(**kwargs) as stream:
+                        response = await stream.get_final_message()
                     return response, None
                 except APIError as e:
                     last_error = e
