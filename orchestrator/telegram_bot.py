@@ -471,7 +471,16 @@ class TelegramBot:
         await self._handle_disposition(update, ctx, "reject")
 
     async def _cmd_modify(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await self._handle_disposition(update, ctx, "modify")
+        """Spec sc4 / Tier 3 — /modify directs SG to revise the PROP within the
+        open exchange cycle. It does NOT mint an AUTH."""
+        if not await self._authorize(update, {"OP"}):
+            return
+        if len(ctx.args) < 2:
+            await self._reply(update, "Usage: `/modify <ARTIFACT-ID> <instructions>`")
+            return
+        artifact_id = ctx.args[0]
+        instructions = " ".join(ctx.args[1:]).strip()
+        await self._reply(update, await self.process_modify(artifact_id, instructions))
 
     async def _handle_disposition(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                   disposition: str) -> None:
@@ -508,7 +517,6 @@ class TelegramBot:
             prop_id=prop_id,
             disposition=disposition,
             reason=text if disposition == "reject" else "",
-            modifications=text if disposition == "modify" else "",
         )
         # Spec §9 — AUTH gets its own (OP, AUTH) sequence counter
         auth.id = await self.sequences.next_id("OP", "AUTH")
@@ -524,18 +532,35 @@ class TelegramBot:
         # delivers to SG inbox. AUTH is now an auditable record.
         await self.router.route(auth)
 
-        # SC-7 (§7.5): export a validated-state snapshot on APPROVE only (not
-        # reject/modify). Shared path → both Telegram /approve and MCP vega_approve
-        # get it. Never blocks the approve flow (write_snapshot swallows errors).
+        # SC-7 (§7.5): export a validated-state snapshot on APPROVE only (reject
+        # does not snapshot; modify is no longer an AUTH at all). Shared path →
+        # both Telegram /approve and MCP vega_approve get it. Never blocks the
+        # approve flow (write_snapshot swallows errors).
         if disposition == "approve":
             from snapshot_manager import write_snapshot
             await write_snapshot(auth, self.config, self.role_manager, self)
 
-        emoji_label = {"approve": "✅", "reject": "❌", "modify": "✏️"}[disposition]
+        emoji_label = {"approve": "✅", "reject": "❌"}[disposition]
         return (
             f"{emoji_label} {auth.id} issued for {prop_id}. "
             f"Archived and routed to SG. SG will write SUM-SG-NNN next execution."
         )
+
+    async def process_modify(self, prop_id: str, instructions: str) -> str:
+        """Spec sc4 / Tier 3 — /modify and vega_modify share this path. NO AUTH is
+        minted. Append a modification directive to the open exchange cycle, resolve
+        the PROP with a text resolution, and flag SG to produce a revised PROP in
+        the same cycle. OP then /approve or /reject the revision."""
+        cycle = self.cycles.get_active_by_artifact(prop_id)
+        if cycle is None:
+            return (f"No active exchange for {prop_id}. /modify needs an open PROP "
+                    f"cycle — the PROP may already be resolved.")
+        self.cycles.append_turn(
+            cycle, f"**OP MODIFICATION DIRECTIVE:** {instructions}", "OP")
+        self.op_backlog.resolve(prop_id, resolution=f"modify-directed: {instructions}")
+        flag_for_execution(self.state_dir, "SG", cycle_id=cycle.id)
+        return (f"↩️ Modification directive sent for {prop_id}. SG will produce a "
+                f"revised PROP in the same cycle — review it, then /approve or /reject.")
 
     async def _cmd_sys(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Governance (SYS audits) is Admin OP's (Spec v5 §12.4).
@@ -1229,7 +1254,8 @@ _READ_HELP = """*Monitoring*
 _OP_HELP = """*VEGA — OP (scope decisions)*
 
 *Scope decisions*
-`/approve <ID>` / `/reject <ID> <reason>` / `/modify <ID> <instructions>`
+`/approve <ID>` / `/reject <ID> <reason>` — issue AUTH
+`/modify <ID> <instructions>` — direct SG to revise the PROP (no AUTH; SG returns a revised PROP to approve/reject)
 `/request <msg>` — ad-hoc scope request to SG (REQ-OP-NNN)
 `/pending` — active PROP exchanges
 

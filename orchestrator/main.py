@@ -203,6 +203,7 @@ class Orchestrator:
                     agent_pause=self._pause_agent,
                     agent_resume=self._resume_agent,
                     process_disposition=self.bot.process_disposition,
+                    process_modify=self.bot.process_modify,   # Tier 3 — /modify directive path
                     state_dir=config.STATE_DIR,
                     router=self.router,
                     admin_backlog=self.admin_backlog,     # Spec v5 §10.1

@@ -84,6 +84,7 @@ class MCPTools:
         admin_backlog: Any | None = None,
         role_manager: Any | None = None,
         telegram_bot: Any | None = None,
+        process_modify: Callable[..., Awaitable[str]] | None = None,
     ) -> None:
         self.config = config
         self.op_backlog = op_backlog
@@ -101,6 +102,7 @@ class MCPTools:
         self.agent_pause = agent_pause
         self.agent_resume = agent_resume
         self.process_disposition = process_disposition
+        self.process_modify = process_modify
         self.state_dir = Path(state_dir)
         self.router = router
 
@@ -241,7 +243,11 @@ class MCPTools:
         return await self.process_disposition(artifact_id, "reject", reason)
 
     async def vega_modify(self, artifact_id: str, instructions: str = "") -> str:
-        return await self.process_disposition(artifact_id, "modify", instructions)
+        # Spec sc4 / Tier 3 — directs SG to revise the PROP within the open cycle;
+        # does NOT mint an AUTH. Same path as Telegram /modify.
+        if self.process_modify is None:
+            return "modify handler not wired"
+        return await self.process_modify(artifact_id, instructions)
 
     async def vega_exchange(self, artifact_id: str, message: str,
                             role_info: dict | None = None) -> str:

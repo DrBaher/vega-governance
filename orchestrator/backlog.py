@@ -96,19 +96,19 @@ class Backlog:
 OPBacklog = Backlog
 
 
-def make_auth(prop_id: str, disposition: str, reason: str = "",
-              modifications: str = "") -> Artifact:
+def make_auth(prop_id: str, disposition: str, reason: str = "") -> Artifact:
     """Construct an AUTH artifact in response to a PROP.
 
     Per Spec §7.2, AUTH is immutable once issued. SG produces SUM separately.
+    Disposition is strictly `approve | reject` (Spec sc4 / Tier 3): `/modify` no
+    longer mints an AUTH — it sends a directive into the open exchange cycle and
+    SG produces a revised PROP, which OP then approves or rejects.
     """
-    if disposition not in {"approve", "reject", "modify"}:
-        raise ValueError(f"Invalid disposition: {disposition}")
+    if disposition not in {"approve", "reject"}:
+        raise ValueError(f"Invalid disposition: {disposition} (approve|reject only)")
     body = f"OP disposition: {disposition}\n"
     if reason:
         body += f"\nReason: {reason}\n"
-    if modifications:
-        body += f"\nModifications:\n{modifications}\n"
 
     return Artifact(
         type="AUTH",
@@ -117,6 +117,5 @@ def make_auth(prop_id: str, disposition: str, reason: str = "",
         content=body,
         references=[prop_id],
         disposition=disposition,
-        modifications=modifications or None,
         timestamp=utcnow_iso(),
     )

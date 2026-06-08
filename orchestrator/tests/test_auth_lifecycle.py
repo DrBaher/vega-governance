@@ -199,8 +199,10 @@ async def test_process_disposition_increments_auth_sequence(tmp_path):
     op_backlog.add(p2)
     cycles.check_cycle_events(p1, recipients=["OP"])
 
+    # Tier 3 (sc4): AUTH disposition is approve|reject only — modify no longer
+    # mints an AUTH. Two AUTH-minting dispositions still increment the sequence.
     r1 = await bot.process_disposition("PROP-SG-001", "approve")
-    r2 = await bot.process_disposition("PROP-SG-002", "modify", "narrow to fixture")
+    r2 = await bot.process_disposition("PROP-SG-002", "reject", "narrow to fixture")
 
     assert "AUTH-OP-001" in r1
     assert "AUTH-OP-002" in r2
