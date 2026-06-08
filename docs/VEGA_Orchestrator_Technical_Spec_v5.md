@@ -1205,13 +1205,16 @@ The dual requirement reflects that restoration reverses the effect of OP's prior
 
 ```python
 def initiate_restore(self, admin_chat_id, snapshot_id):
-    """Phase 1: Admin OP initiates."""
+    """Phase 1: Admin OP initiates. Clears any stale OP-side phase-2
+    entry from a previous restore attempt to prevent wrong-snapshot consent."""
+    op_telegram_id = self.get_telegram_id("OP")
+    if op_telegram_id and op_telegram_id in self._pending_restores:
+        del self._pending_restores[op_telegram_id]
     otp = self._generate_otp()
     self._pending_restores[admin_chat_id] = {
         "snapshot_id": snapshot_id,
         "otp": otp,
         "expires": time.time() + OTP_EXPIRY,
-        "phase": "admin_confirm"
     }
     return otp
 
@@ -1228,7 +1231,6 @@ def confirm_restore_admin(self, admin_chat_id, otp):
         "snapshot_id": snapshot_id,
         "otp": op_otp,
         "expires": time.time() + OTP_EXPIRY,
-        "phase": "op_consent"
     }
     self._log_event("restore_initiated", snapshot_id=snapshot_id)
     return op_telegram_id, op_otp
@@ -1260,9 +1262,17 @@ async def restore_scope(snapshot_id, executor, telegram_bot, role_manager):
     os.makedirs(backup)
     shutil.copytree(SCOPE_DIR, f"{backup}/scope")
 
-    # 3. Replace scope/
-    shutil.rmtree(SCOPE_DIR)
-    shutil.copytree(f"{snap_dir}/scope", SCOPE_DIR)
+    # 3. Replace scope/ — atomic via staging to avoid a window with no scope/ dir.
+    # If copytree to staging fails, the live scope/ is untouched.
+    # Pre-clean in case a prior restore crashed mid-staging.
+    staging = f"{SCOPE_DIR}.restoring"
+    if os.path.exists(staging):
+        shutil.rmtree(staging)
+    shutil.copytree(f"{snap_dir}/scope", staging)
+    old = f"{SCOPE_DIR}.pre-{int(time.time())}"
+    shutil.move(SCOPE_DIR, old)
+    shutil.move(staging, SCOPE_DIR)
+    shutil.rmtree(old)  # pre-restore backup already saved in step 2
 
     # 4. Log
     role_manager._log_event("restore_executed", snapshot_id=snapshot_id)
@@ -2214,7 +2224,13 @@ class RoleManager:
     # RoleManager handles only the 2FA flow.
 
     def initiate_restore(self, admin_chat_id, snapshot_id):
-        """Phase 1: Admin OP initiates."""
+        """Phase 1: Admin OP initiates. Clears any stale OP-side phase-2
+        entry from a previous restore attempt to prevent wrong-snapshot consent."""
+        # Clear stale phase-2 entry if Admin OP re-initiates while OP
+        # consent from a previous attempt is still pending
+        op_telegram_id = self.get_telegram_id("OP")
+        if op_telegram_id and op_telegram_id in self._pending_restores:
+            del self._pending_restores[op_telegram_id]
         otp = self._generate_otp()
         self._pending_restores[admin_chat_id] = {
             "snapshot_id": snapshot_id,
