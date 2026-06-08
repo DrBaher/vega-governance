@@ -145,8 +145,14 @@ class Orchestrator:
             admin_backlog=self.admin_backlog,   # Spec v5 §4.2 — GOV → Admin OP
             telegram_bot=self.bot,
             cycles=self.cycles,   # audit NEW-1 — stamp routing_log with cycle_id
+            config=config,        # Spec sc4 §4.3 — scope/test file commit dirs
         )
         self.bot.router = self.router
+
+        # Spec sc4 §4.3 — clean any `.incoming` debris from a restore/commit that
+        # was interrupted mid-write. The DOC is immutable in the archive, so a
+        # re-routed PRO-* will re-commit cleanly; stale staging files are inert.
+        self._clean_propagation_staging()
 
         self._execution_count = 0
         self._stopping = False
@@ -467,6 +473,25 @@ class Orchestrator:
 
     def _resume_agent(self, code: str) -> None:
         self.paused_agents.discard(code)
+
+    def _clean_propagation_staging(self) -> None:
+        """Delete leftover `*.incoming` staging files from an interrupted
+        scope/test commit (Spec sc4 §4.3 recovery). Safe: the source DOC is
+        immutable in the archive, so a re-routed PRO-* re-commits cleanly."""
+        for attr in ("SCOPE_DIR", "TEST_MODELS_FULL_DIR", "TEST_MODELS_BUILD_DIR"):
+            d = getattr(config, attr, None)
+            if not d:
+                continue
+            p = Path(d)
+            if not p.exists():
+                continue
+            for stale in p.glob("*.incoming"):
+                try:
+                    stale.unlink()
+                    print(f"[init] removed stale propagation staging file: {stale}",
+                          flush=True)
+                except OSError:
+                    pass
 
 
 def _recipients_for(artifact: Artifact) -> list[str]:

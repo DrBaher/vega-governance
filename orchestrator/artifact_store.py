@@ -8,12 +8,37 @@ modified. Routing operates on outbox→archive→inbox copies, not on shared ref
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 from pathlib import Path
 
 from models import Artifact, PRIORITY_ORDER
 from state_manager import LOCKS, atomic_write
+
+
+_FILE_MARKER_RE = re.compile(r"(?m)^###[ \t]+FILE:[ \t]*(.+?)[ \t]*$")
+_APP_NOTES_RE = re.compile(r"(?m)^###[ \t]+APPLICATION_NOTES[ \t]*$")
+
+
+def parse_file_sections(content: str) -> dict[str, str]:
+    """Parse a DOC body's `### FILE: <name>` sections into {filename: file_content}
+    (Spec sc4 §4.3). Each file's content runs until the next `### FILE:` marker or
+    the `### APPLICATION_NOTES` marker (SE/TE's report — not a file, excluded) or
+    end of body. Filenames may be bracketed (`### FILE: [doc.md]`). Returns {} if
+    there are no FILE markers."""
+    notes = _APP_NOTES_RE.search(content)
+    limit = notes.start() if notes else len(content)
+    matches = [m for m in _FILE_MARKER_RE.finditer(content) if m.start() < limit]
+    out: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        name = m.group(1).strip().strip("[]").strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else limit
+        body = content[start:end].strip("\n")
+        if name:
+            out[name] = body
+    return out
 
 
 def _read_text(path: str | Path) -> str:
@@ -264,6 +289,11 @@ class ArtifactStore:
 
     def archive_artifact(self, artifact: Artifact) -> Path:
         return self.archive.write(artifact)
+
+    def load_from_archive(self, artifact_id: str) -> Artifact | None:
+        """Canonical immutable-archive read (Spec sc4 — standardized name; use
+        this everywhere instead of reaching into `.archive.load`)."""
+        return self.archive.load(artifact_id)
 
     def write_thinking(self, artifact_id: str,
                        thinking_blocks: list[str] | None) -> Path | None:

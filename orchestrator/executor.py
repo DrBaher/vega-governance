@@ -800,7 +800,7 @@ class AgentExecutor:
                 if not rid or rid in seen or rid in inbox_ids:
                     continue
                 seen.add(rid)
-                art = self.store.archive.load(rid)
+                art = self.store.load_from_archive(rid)
                 if art is None:
                     continue   # referent not in archive (external ref, e.g. a doc §)
                 body = art.to_markdown()

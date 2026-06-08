@@ -10,12 +10,13 @@ Per Spec §4.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
-from artifact_store import ArtifactStore
+from artifact_store import ArtifactStore, parse_file_sections
 from models import Artifact, make_gov
-from state_manager import LOCKS, atomic_save_json, load_json
+from state_manager import LOCKS, atomic_save_json, atomic_write, load_json
 
 
 # ─── Agent-to-agent routes ───────────────────────────────────────────────────
@@ -113,7 +114,7 @@ class Router:
 
     def __init__(self, store: ArtifactStore, state_dir: str | Path,
                  op_backlog=None, telegram_bot=None, cycles=None,
-                 admin_backlog=None) -> None:
+                 admin_backlog=None, config=None) -> None:
         self.store = store
         self.routing_log = Path(state_dir) / "routing_log.json"
         self.op_backlog = op_backlog
@@ -124,6 +125,10 @@ class Router:
         # cycle id (audit NEW-1; Spec §17.2). Optional so the Router can still
         # be constructed in tests/bootstrap before cycles exist.
         self.cycles = cycles
+        # Config — provides SCOPE_DIR / TEST_MODELS_* for the scope/test file
+        # commit on PRO-SCOPE/PRO-TEST routing (Spec sc4 §4.3). Optional so the
+        # Router can be constructed without it (commit then no-ops).
+        self.config = config
 
     def _backlog_for(self, route: dict[str, Any]):
         """Pick the decision backlog a backlog-route targets (Spec §4.2)."""
@@ -162,10 +167,71 @@ class Router:
         if not artifact.references:
             return None
         ref_id = artifact.references[0]
-        referenced = self.store.archive.load(ref_id)
+        referenced = self.store.load_from_archive(ref_id)
         if referenced is None:
             return None
         return referenced.type
+
+    def _propagation_target_dir(self, artifact_type: str) -> str | None:
+        """Target dir for a propagation commit (Spec sc4 §4.3), or None if this
+        type doesn't commit files / no config is wired."""
+        cfg = self.config
+        if cfg is None:
+            return None
+        if artifact_type == "PRO-SCOPE":
+            return getattr(cfg, "SCOPE_DIR", None)
+        if artifact_type == "PRO-TEST-FULL":
+            return getattr(cfg, "TEST_MODELS_FULL_DIR", None)
+        if artifact_type == "PRO-TEST-BUILD":
+            return getattr(cfg, "TEST_MODELS_BUILD_DIR", None)
+        return None
+
+    async def commit_propagation_files(self, artifact: Artifact) -> None:
+        """Spec sc4 §4.3 — write scope/test files from the referenced (validated,
+        archived) DOC to disk. THE ONLY code path that writes to scope/ or
+        test_models/. Write-ahead: stage every file as `<name>.incoming` (live
+        files untouched), then `os.replace` each into place (atomic per file on
+        the same filesystem). A `.incoming` left on disk after a crash is safe to
+        delete — the DOC is immutable in the archive and the commit is idempotent.
+        Never raises: a commit failure is logged for SYS but must not break routing."""
+        target_dir = self._propagation_target_dir(artifact.type)
+        if target_dir is None:
+            return
+        try:
+            if not artifact.references:
+                print(f"[router] propagation_commit: {artifact.type} {artifact.id} "
+                      f"has no referenced DOC — nothing committed", flush=True)
+                return
+            doc_id = artifact.references[0]
+            doc = self.store.load_from_archive(doc_id)
+            if doc is None:
+                print(f"[router] propagation_commit: DOC {doc_id} not in archive "
+                      f"(for {artifact.id}) — nothing committed", flush=True)
+                return
+            files = parse_file_sections(doc.content)
+            if not files:
+                print(f"[router] propagation_commit: no ### FILE: markers in {doc_id} "
+                      f"(for {artifact.id}) — nothing committed", flush=True)
+                return
+            target = Path(target_dir)
+            target.mkdir(parents=True, exist_ok=True)
+            # Phase 1 — stage all .incoming (old files untouched).
+            staged: list[str] = []
+            for filename, content in files.items():
+                # Path-traversal / nested-path safety: commit only flat filenames.
+                if "/" in filename or "\\" in filename or ".." in filename:
+                    print(f"[router] propagation_commit: rejecting unsafe filename "
+                          f"{filename!r} in {doc_id}", flush=True)
+                    continue
+                body = content if content.endswith("\n") else content + "\n"
+                atomic_write(target / f"{filename}.incoming", body)
+                staged.append(filename)
+            # Phase 2 — swap all into place (atomic per file).
+            for filename in staged:
+                os.replace(target / f"{filename}.incoming", target / filename)
+        except Exception as e:  # never break routing on a commit failure
+            print(f"[router] propagation_commit FAILED for {artifact.id} "
+                  f"({artifact.type}): {type(e).__name__}: {e}", flush=True)
 
     async def route(self, artifact: Artifact) -> None:
         """Place artifact in each recipient's inbox, archive immutably, log."""
@@ -177,6 +243,12 @@ class Router:
         if key not in ROUTING_TABLE:
             await self._handle_unknown(artifact, key)
             return
+
+        # Spec sc4 §4.3 — commit scope/test files from the referenced DOC to disk
+        # BEFORE delivering PRO-SCOPE/PRO-TEST to downstream inboxes, so those
+        # agents read the updated files on their next execution. No-op for other
+        # artifact types. Never raises.
+        await self.commit_propagation_files(artifact)
 
         # Single table loop (Spec §4.1-4.2). A route with a `backlog` key goes to
         # a decision backlog + notify; otherwise inbox / external / archive.

@@ -185,6 +185,38 @@ not routed.
 """
 
 
+# SE/TE only — how to apply scope/test file edits via the DOC body (Spec sc4 §4.3).
+# This is what lets a Scope/Tests Editor actually change scope/ or test_models/:
+# emit the full modified file(s) inside the DOC, the Guardian validates, and the
+# orchestrator writes the files when the Guardian emits PRO-SCOPE / PRO-TEST.
+EDITOR_DOC_FORMAT_BLOCK = """\
+## DOC body format — applying scope/test file edits (Spec §4.3)
+
+To apply an SCN/TCN you MUST emit exactly one `### ARTIFACT` block of type `DOC`
+whose body carries the FULL modified file(s) plus your report, delimited like so:
+
+    ### FILE: exact_filename.md
+    <the entire modified file content — not a diff>
+
+    ### FILE: another_file.md
+    <the entire modified file content>
+
+    ### APPLICATION_NOTES
+    <items applied, verification checklist results, any issues>
+
+Rules:
+- One `### FILE:` per modified document; include the WHOLE file, not a fragment.
+- Use the exact filename only — no directory path, no surrounding brackets.
+- Do NOT paste the report as loose prose — it must sit under `### APPLICATION_NOTES`,
+  and the whole thing must be inside the `### ARTIFACT` (type DOC) block. Output
+  with no `### ARTIFACT` wrapper is rejected as malformed and applies nothing.
+- The orchestrator does NOT touch scope/ or test_models/ at DOC time. Your DOC is
+  validated by the Guardian (SG/TG); the files are written only when the Guardian
+  emits the PRO-SCOPE / PRO-TEST signal referencing your DOC.
+- `### APPLICATION_NOTES` is your report — never written as a file.
+"""
+
+
 def compose_system_prompt(
     framework_text: str,
     agent_code: str,
@@ -209,6 +241,9 @@ def compose_system_prompt(
         )
 
     project_line = f"Project: {project_name}\n" if project_name else ""
+    # SE/TE additionally get the DOC `### FILE:` application format (Spec sc4 §4.3).
+    editor_doc_format = (
+        "\n" + EDITOR_DOC_FORMAT_BLOCK if agent_code in {"SE", "TE"} else "")
 
     return f"""\
 # Role: {name} ({agent_code})
@@ -232,7 +267,7 @@ Instance: {agent_code}-S[NNN]
 - Scope documents: per Spec §3.2 access table.
 
 {OUTPUT_FORMAT_BLOCK}
-
+{editor_doc_format}
 ## Authority Hierarchy (D-ARCH-030)
 Sources > Role definition > Own wiki > UNIVERSAL > Session context.
 On contradiction, higher layer wins. Flag the contradiction in log.md and
