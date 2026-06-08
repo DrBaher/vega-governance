@@ -240,9 +240,12 @@ class Orchestrator:
                     print(f"[main] ⚠ tick failed: {err}", flush=True)
                     traceback.print_exc()
                     try:
+                        # Tick failures are operational/governance — Admin OP's
+                        # domain (audit LOW-2), not the scope-decision OP's.
                         await self.bot.send(
                             f"⚠️ *Tick failed* — {err}. Orchestrator continues; "
-                            f"check terminal logs for the traceback."
+                            f"check terminal logs for the traceback.",
+                            role="ADMIN_OP"
                         )
                     except Exception:
                         pass
@@ -278,6 +281,7 @@ class Orchestrator:
 
         # 2. Execute agents with unprocessed inbox
         tasks = []
+        task_agents = []   # parallel list — attribute gather results/exceptions
         for agent_code in config.AGENTS:
             if agent_code in self.paused_agents:
                 continue
@@ -285,9 +289,22 @@ class Orchestrator:
                 continue   # SYS runs on schedule / threshold / on-demand
             if self.store.inbox(agent_code).has_unprocessed():
                 tasks.append(self.executor.execute(agent_code))
+                task_agents.append(agent_code)
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
+            for i, r in enumerate(results):
+                # gather(return_exceptions=True) surfaces a raised exception as the
+                # result item. Without this branch it would hit no handler — the
+                # agent's inbox stays unprocessed with zero operator visibility.
+                if isinstance(r, BaseException):
+                    agent_code = task_agents[i]
+                    print(f"[main] agent {agent_code} execution failed: "
+                          f"{type(r).__name__}: {r}", flush=True)
+                    await self.bot.send(
+                        f"⚠️ Agent `{agent_code}` execution failed: "
+                        f"{type(r).__name__}: {r}. Inbox left unprocessed; it will "
+                        f"retry next tick.", role="ADMIN_OP")
+                    continue
                 if isinstance(r, dict):
                     if r.get("threshold_tripped"):
                         threshold_tripped = True

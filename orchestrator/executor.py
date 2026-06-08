@@ -597,7 +597,12 @@ class AgentExecutor:
                          + "\n".join(f"- {c}" for c in universal_conflicts)
                          + "\n\nThe proposed UNIVERSAL change was NOT applied. "
                          "Review and either re-issue a compliant change or "
-                         "resolve via /resolve."))
+                         "resolve via /resolve.\n\n"
+                         "⚠️ Heuristic check (audit LOW-5): this validator uses "
+                         "pattern matching and can miss a violation phrased "
+                         "differently, or flag a benign one. Admin OP should "
+                         "review the proposed change semantically against the four "
+                         "invariants — do not rely on this validator alone."))
             artifacts.append(gov)
             self.wiki.append_log(agent_code, LogEntry(
                 "AUTHORITY_BOUNDARY | Blocked UNIVERSAL update(s): "

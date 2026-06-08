@@ -110,9 +110,12 @@ def test_vega_scope_available_to_all_roles():
 # ─── #7 / NEW-6 thinking sidecar ─────────────────────────────────────────────
 
 def test_archive_writes_thinking_sidecar(tmp_path):
+    # The executor writes the sidecar via write_thinking() at production time
+    # (LOW-4 removed the dead thinking_blocks param from archive_artifact).
     store = ArtifactStore(tmp_path / "agents", tmp_path / "archive")
     a = Artifact(type="SCN", sender="SG", content="body", id="SCN-SG-001")
-    store.archive_artifact(a, thinking_blocks=["first thought", "second thought"])
+    store.archive_artifact(a)
+    store.write_thinking("SCN-SG-001", ["first thought", "second thought"])
     sidecar = tmp_path / "archive" / "SCN-SG-001.thinking.md"
     assert sidecar.exists()
     text = sidecar.read_text()

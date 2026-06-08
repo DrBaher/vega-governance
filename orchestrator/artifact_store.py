@@ -143,16 +143,13 @@ class Archive:
         self.dir = Path(archive_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
 
-    def write(self, artifact: Artifact,
-              thinking_blocks: list[str] | None = None) -> Path:
+    def write(self, artifact: Artifact) -> Path:
         if not artifact.id:
             raise ValueError("Cannot archive artifact without id")
         path = self.dir / f"{artifact.id}.md"
-        # SC-4 / NEW-6 — persist the reasoning that produced this artifact as an
-        # immutable sidecar alongside it (Spec §7.1 + §7.4). Best-effort: a
-        # sidecar failure must never block archival.
-        if thinking_blocks:
-            self.write_thinking(artifact.id, thinking_blocks)
+        # SC-4 / NEW-6 — the reasoning sidecar ({id}.thinking.md) is written by the
+        # executor via write_thinking() at production time, not here (the router
+        # archives without thinking context). See write_thinking/read_thinking.
         if path.exists():
             # Already archived (e.g., multi-recipient routing). Don't rewrite.
             # Spec §7.4 immutability rule: the FIRST write wins. If the new
@@ -265,9 +262,8 @@ class ArtifactStore:
     def get_outbox(self, agent_code: str) -> list[Artifact]:
         return self.outbox(agent_code).list_pending()
 
-    def archive_artifact(self, artifact: Artifact,
-                         thinking_blocks: list[str] | None = None) -> Path:
-        return self.archive.write(artifact, thinking_blocks=thinking_blocks)
+    def archive_artifact(self, artifact: Artifact) -> Path:
+        return self.archive.write(artifact)
 
     def write_thinking(self, artifact_id: str,
                        thinking_blocks: list[str] | None) -> Path | None:

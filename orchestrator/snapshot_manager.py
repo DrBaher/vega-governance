@@ -201,9 +201,20 @@ async def restore_scope(snapshot_id, config, execute_sys: Callable, telegram_bot
     backup = local_dir / f"pre-restore-{int(time.time())}"
     backup.mkdir(parents=True, exist_ok=True)
     shutil.copytree(config.SCOPE_DIR, backup / "scope", symlinks=False)
-    # 3. replace scope/ ONLY (wikis, archive, routing_log untouched)
-    shutil.rmtree(config.SCOPE_DIR)
-    shutil.copytree(snap_dir / "scope", config.SCOPE_DIR)
+    # 3. replace scope/ ONLY (wikis, archive, routing_log untouched) — ATOMIC via
+    # staging (audit MED-2). The failure-prone copytree writes to a staging dir
+    # BEFORE the live scope/ is touched; the swap is two same-FS renames. So a
+    # mid-restore failure can never leave the deployment with no scope/ dir.
+    # Pre-clean staging in case a prior restore crashed mid-stage.
+    scope_path = Path(config.SCOPE_DIR)
+    staging = scope_path.with_name(scope_path.name + ".restoring")
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(snap_dir / "scope", staging, symlinks=False)
+    old = scope_path.with_name(scope_path.name + f".pre-{int(time.time())}")
+    shutil.move(str(scope_path), str(old))
+    shutil.move(str(staging), str(scope_path))
+    shutil.rmtree(old, ignore_errors=True)   # durable backup already saved in step 2
     # 4. log
     role_manager._log_event("restore_executed", snapshot_id=snapshot_id, result="success")
     # 5. SYS audit BEFORE resuming — surface wiki-vs-restored-scope inconsistencies

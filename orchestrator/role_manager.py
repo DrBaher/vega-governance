@@ -151,6 +151,13 @@ class RoleManager:
 
     def initiate_restore(self, admin_chat_id, snapshot_id) -> str:
         """Phase 1: Admin OP initiates restoration → OTP to Admin OP."""
+        # Clear any stale OP-side phase-2 entry from a previous attempt (audit
+        # MED-3): if Admin OP re-initiates with a different snapshot before the
+        # OP consented to the first, a left-over phase-2 entry would let the OP
+        # consent to the WRONG snapshot.
+        op_telegram_id = self.get_telegram_id("OP")
+        if op_telegram_id and str(op_telegram_id) in self._pending_restores:
+            del self._pending_restores[str(op_telegram_id)]
         otp = self._generate_otp()
         self._pending_restores[str(admin_chat_id)] = {
             "snapshot_id": snapshot_id, "otp": otp,

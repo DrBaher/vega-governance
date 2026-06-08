@@ -209,6 +209,38 @@ async def test_restore_replaces_scope_and_keeps_agents_paused(tmp_path):
     assert len(sys_calls) == 1 and "Post-restoration audit" in sys_calls[0]
     # restore logged
     assert "restore_executed" in (tmp_path / "state" / "role_events.jsonl").read_text()
+    # MED-2 atomic swap leaves no staging/transient dirs behind
+    scope_parent = Path(cfg.SCOPE_DIR).parent
+    assert not list(scope_parent.glob("scope.restoring"))
+    assert not list(scope_parent.glob("scope.pre-*"))
+
+
+@pytest.mark.asyncio
+async def test_restore_cleans_prior_staging_debris(tmp_path):
+    """MED-2 — a leftover `scope.restoring` from a crashed prior restore is
+    pre-cleaned, so a fresh restore still succeeds."""
+    cfg = _Cfg(tmp_path)
+    _seed_scope(cfg)
+    _seed_archive(cfg, "AUTH-OP-001", "PROP-SG-007")
+    snap_id = await sm.write_snapshot(_auth(), cfg)
+    # plant debris
+    debris = Path(cfg.SCOPE_DIR).with_name("scope.restoring")
+    debris.mkdir(parents=True)
+    (debris / "junk.md").write_text("stale")
+    rm = RoleManager(tmp_path / "config" / "roles.json",
+                     tmp_path / "config" / "invites",
+                     tmp_path / "state" / "role_events.jsonl",
+                     tmp_path / "config" / "recovery.hash")
+
+    async def _execute_sys(audit_request=None):
+        pass
+
+    ok = await sm.restore_scope(snap_id, cfg, execute_sys=_execute_sys,
+                                telegram_bot=None, role_manager=rm,
+                                pause_all=lambda: None)
+    assert ok is True
+    assert "body v7.2" in (Path(cfg.SCOPE_DIR) / "Scope_v7.2.md").read_text()
+    assert not debris.exists()
 
 
 @pytest.mark.asyncio
