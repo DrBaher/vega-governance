@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from artifact_store import ArtifactStore, parse_file_sections
+from artifact_store import ArtifactStore, parse_edit_ops, parse_file_sections
 from models import Artifact, make_gov
 from state_manager import LOCKS, atomic_save_json, atomic_write, load_json
 
@@ -186,13 +186,21 @@ class Router:
             return getattr(cfg, "TEST_MODELS_BUILD_DIR", None)
         return None
 
+    @staticmethod
+    def _unsafe_filename(name: str) -> bool:
+        """Reject path traversal / nested paths — commit only flat filenames."""
+        return "/" in name or "\\" in name or ".." in name
+
     async def commit_propagation_files(self, artifact: Artifact) -> None:
         """Spec sc4 §4.3 — write scope/test files from the referenced (validated,
         archived) DOC to disk. THE ONLY code path that writes to scope/ or
-        test_models/. Write-ahead: stage every file as `<name>.incoming` (live
-        files untouched), then `os.replace` each into place (atomic per file on
-        the same filesystem). A `.incoming` left on disk after a crash is safe to
-        delete — the DOC is immutable in the archive and the commit is idempotent.
+        test_models/. Two DOC modes:
+          • `### FILE:` — full-file replacement (new files / full rewrites).
+          • `### EDIT:` — surgical find/replace ops applied to the LIVE file, so a
+            large doc isn't re-emitted to change a few lines (B / §4.3 patch mode).
+        Both use write-ahead staging (`<name>.incoming` → `os.replace`, atomic per
+        file). An EDIT whose anchor is missing or ambiguous (≠1 match) is REJECTED
+        for that file (no write) rather than guessing — no partial/where-wrong edits.
         Never raises: a commit failure is logged for SYS but must not break routing."""
         target_dir = self._propagation_target_dir(artifact.type)
         if target_dir is None:
@@ -209,25 +217,55 @@ class Router:
                       f"(for {artifact.id}) — nothing committed", flush=True)
                 return
             files = parse_file_sections(doc.content)
-            if not files:
-                print(f"[router] propagation_commit: no ### FILE: markers in {doc_id} "
-                      f"(for {artifact.id}) — nothing committed", flush=True)
+            edit_ops = parse_edit_ops(doc.content)
+            if not files and not edit_ops:
+                print(f"[router] propagation_commit: no ### FILE: or ### EDIT: markers "
+                      f"in {doc_id} (for {artifact.id}) — nothing committed", flush=True)
                 return
             target = Path(target_dir)
             target.mkdir(parents=True, exist_ok=True)
-            # Phase 1 — stage all .incoming (old files untouched).
-            staged: list[str] = []
+
+            # ── Full-file mode (### FILE:) ──
+            full_staged: list[str] = []
             for filename, content in files.items():
-                # Path-traversal / nested-path safety: commit only flat filenames.
-                if "/" in filename or "\\" in filename or ".." in filename:
+                if self._unsafe_filename(filename):
                     print(f"[router] propagation_commit: rejecting unsafe filename "
                           f"{filename!r} in {doc_id}", flush=True)
                     continue
                 body = content if content.endswith("\n") else content + "\n"
                 atomic_write(target / f"{filename}.incoming", body)
-                staged.append(filename)
-            # Phase 2 — swap all into place (atomic per file).
-            for filename in staged:
+                full_staged.append(filename)
+            for filename in full_staged:
+                os.replace(target / f"{filename}.incoming", target / filename)
+
+            # ── Surgical mode (### EDIT:) — apply ops in-place against the LIVE file ──
+            edits_by_file: dict[str, list[tuple[str, str]]] = {}
+            for filename, find, replace in edit_ops:
+                if self._unsafe_filename(filename):
+                    print(f"[router] propagation_commit: rejecting unsafe filename "
+                          f"{filename!r} in {doc_id}", flush=True)
+                    continue
+                edits_by_file.setdefault(filename, []).append((find, replace))
+            for filename, ops in edits_by_file.items():
+                path = target / filename
+                if not path.exists():
+                    print(f"[router] propagation_commit: EDIT target {filename} "
+                          f"missing (for {doc_id}) — skipped, no write", flush=True)
+                    continue
+                text = path.read_text()
+                ok = True
+                for find, replace in ops:
+                    n = text.count(find)
+                    if n != 1:
+                        print(f"[router] propagation_commit: EDIT anchor in {filename} "
+                              f"matched {n}× (need exactly 1) for {doc_id} — file "
+                              f"REJECTED, no write", flush=True)
+                        ok = False
+                        break
+                    text = text.replace(find, replace, 1)
+                if not ok:
+                    continue   # leave the file untouched — never a partial apply
+                atomic_write(target / f"{filename}.incoming", text)
                 os.replace(target / f"{filename}.incoming", target / filename)
         except Exception as e:  # never break routing on a commit failure
             print(f"[router] propagation_commit FAILED for {artifact.id} "

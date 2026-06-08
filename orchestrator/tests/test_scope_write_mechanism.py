@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from artifact_store import ArtifactStore, parse_file_sections
+from artifact_store import ArtifactStore, parse_edit_ops, parse_file_sections
 from models import Artifact
 from router import Router
 from sequence_manager import SequenceManager
@@ -42,6 +42,33 @@ def test_parse_file_sections_bracketed_names_and_empty():
     files = parse_file_sections("### FILE: [doc_1.md]\ncontent\n")
     assert "doc_1.md" in files
     assert parse_file_sections("just prose, no markers") == {}
+
+
+# ─── parse_edit_ops (surgical patch mode, §4.3 / B) ──────────────────────────
+
+EDIT_DOC = (
+    "### EDIT: Big_Doc.md\n"
+    "<<<<<<< FIND\n**Version:** 1.0 | March 2026\n=======\n"
+    "**Version:** 1.1 | June 2026\n>>>>>>> REPLACE\n\n"
+    "### EDIT: Other.md\n"
+    "<<<<<<< FIND\n| SCN-SG-001 | 41 items |\n=======\n"
+    "| SCN-SG-001 | 43 items |\n>>>>>>> REPLACE\n\n"
+    "### APPLICATION_NOTES\nboth edits applied\n"
+)
+
+
+def test_parse_edit_ops_basic():
+    ops = parse_edit_ops(EDIT_DOC)
+    assert len(ops) == 2
+    assert ops[0] == ("Big_Doc.md", "**Version:** 1.0 | March 2026",
+                      "**Version:** 1.1 | June 2026")
+    assert ops[1][0] == "Other.md"
+    # APPLICATION_NOTES excluded
+    assert all("applied" not in r for _, _, r in ops)
+
+
+def test_parse_edit_ops_none():
+    assert parse_edit_ops("### FILE: x.md\nfull content\n") == []
 
 
 # ─── commit_propagation_files ────────────────────────────────────────────────
@@ -83,6 +110,48 @@ async def test_commit_pro_scope_writes_files_atomically(tmp_path):
     assert (scope / "Scope_v7.2.md").read_text().rstrip() == "# Scope\nnew validated content"
     # write-ahead staging cleaned up
     assert not list(scope.glob("*.incoming"))
+
+
+@pytest.mark.asyncio
+async def test_commit_edit_surgical_preserves_rest_of_big_file(tmp_path):
+    # A large existing scope doc; SE changes ONE line via ### EDIT: (not re-emitted)
+    big = "# DB Spec\n" + ("filler line\n" * 5000) + "**Version:** 1.0 | March 2026\n" + ("more\n" * 5000)
+    scope = Path(tmp_path / "scope"); scope.mkdir(parents=True)
+    (scope / "Big.md").write_text(big)
+    doc = ("### EDIT: Big.md\n<<<<<<< FIND\n**Version:** 1.0 | March 2026\n=======\n"
+           "**Version:** 1.1 | June 2026\n>>>>>>> REPLACE\n\n### APPLICATION_NOTES\nok\n")
+    router, _ = _router_with_doc(tmp_path, "DOC-SE-010", doc)
+    await router.commit_propagation_files(
+        Artifact(type="PRO-SCOPE", sender="SG", id="PRO-SCOPE-010", references=["DOC-SE-010"]))
+    result = (scope / "Big.md").read_text()
+    assert "**Version:** 1.1 | June 2026" in result
+    assert "**Version:** 1.0 | March 2026" not in result
+    assert result.count("filler line") == 5000 and result.count("more") == 5000  # rest intact
+    assert not list(scope.glob("*.incoming"))
+
+
+@pytest.mark.asyncio
+async def test_commit_edit_anchor_not_found_rejects_no_write(tmp_path):
+    scope = Path(tmp_path / "scope"); scope.mkdir(parents=True)
+    (scope / "Doc.md").write_text("original content unchanged\n")
+    doc = ("### EDIT: Doc.md\n<<<<<<< FIND\nTEXT THAT DOES NOT EXIST\n=======\n"
+           "replacement\n>>>>>>> REPLACE\n")
+    router, _ = _router_with_doc(tmp_path, "DOC-SE-011", doc)
+    await router.commit_propagation_files(
+        Artifact(type="PRO-SCOPE", sender="SG", id="PRO-SCOPE-011", references=["DOC-SE-011"]))
+    assert (scope / "Doc.md").read_text() == "original content unchanged\n"  # untouched
+    assert not list(scope.glob("*.incoming"))
+
+
+@pytest.mark.asyncio
+async def test_commit_edit_ambiguous_anchor_rejects(tmp_path):
+    scope = Path(tmp_path / "scope"); scope.mkdir(parents=True)
+    (scope / "Doc.md").write_text("dup\ndup\nkeep\n")   # 'dup' appears twice
+    doc = ("### EDIT: Doc.md\n<<<<<<< FIND\ndup\n=======\nchanged\n>>>>>>> REPLACE\n")
+    router, _ = _router_with_doc(tmp_path, "DOC-SE-012", doc)
+    await router.commit_propagation_files(
+        Artifact(type="PRO-SCOPE", sender="SG", id="PRO-SCOPE-012", references=["DOC-SE-012"]))
+    assert (scope / "Doc.md").read_text() == "dup\ndup\nkeep\n"  # untouched (ambiguous)
 
 
 @pytest.mark.asyncio
@@ -180,9 +249,10 @@ def test_editor_doc_format_in_se_te_prompts():
     from framework_parser import compose_system_prompt, AGENT_TO_SECTION
     # only run for agents whose section the fixture provides
     se = compose_system_prompt(FW_FIXTURE, "SE")
-    assert "### FILE:" in se and "APPLICATION_NOTES" in se
+    assert "### EDIT:" in se and "### FILE:" in se and "APPLICATION_NOTES" in se
+    assert "FIND" in se and "REPLACE" in se   # surgical format documented
     sg = compose_system_prompt(FW_FIXTURE, "SG")
-    assert "### FILE:" not in sg  # guardians don't apply files
+    assert "### EDIT:" not in sg and "### FILE:" not in sg  # guardians don't apply files
 
 
 def test_clean_propagation_staging_wired():

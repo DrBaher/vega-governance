@@ -192,28 +192,46 @@ not routed.
 EDITOR_DOC_FORMAT_BLOCK = """\
 ## DOC body format — applying scope/test file edits (Spec §4.3)
 
-To apply an SCN/TCN you MUST emit exactly one `### ARTIFACT` block of type `DOC`
-whose body carries the FULL modified file(s) plus your report, delimited like so:
+To apply an SCN/TCN you emit exactly one `### ARTIFACT` block of type `DOC` whose
+body carries the changes plus your report. There are TWO ways to express a change;
+PREFER surgical edits.
+
+### Preferred — surgical edits (### EDIT:)  ⟵ use this for changes to existing docs
+
+Emit one `### EDIT:` block per change. Do NOT reproduce the whole document — give
+only the exact text to find and its replacement, using these markers verbatim:
+
+    ### EDIT: exact_filename.md
+    <<<<<<< FIND
+    <the exact current text to locate — copy it verbatim from the document>
+    =======
+    <the replacement text>
+    >>>>>>> REPLACE
+
+Rules for surgical edits:
+- The FIND text must match the CURRENT document EXACTLY and occur EXACTLY ONCE.
+  Include enough surrounding context to make it unique. If your anchor isn't unique
+  or doesn't match, the orchestrator REJECTS that file (no write) rather than
+  guessing — so make the anchor precise.
+- One change per `### EDIT:` block; emit several blocks for several changes (they
+  may target the same or different files).
+- This is how you edit large documents cheaply — never re-emit a whole big file to
+  change a few lines.
+
+### Alternative — full file (### FILE:)  ⟵ only for NEW files or a full rewrite
 
     ### FILE: exact_filename.md
-    <the entire modified file content — not a diff>
+    <the entire file content>
 
-    ### FILE: another_file.md
-    <the entire modified file content>
-
-    ### APPLICATION_NOTES
-    <items applied, verification checklist results, any issues>
-
-Rules:
-- One `### FILE:` per modified document; include the WHOLE file, not a fragment.
+Common rules:
 - Use the exact filename only — no directory path, no surrounding brackets.
-- Do NOT paste the report as loose prose — it must sit under `### APPLICATION_NOTES`,
-  and the whole thing must be inside the `### ARTIFACT` (type DOC) block. Output
-  with no `### ARTIFACT` wrapper is rejected as malformed and applies nothing.
+- End the DOC with your report under `### APPLICATION_NOTES` (items applied,
+  verification checklist, issues). It is never written as a file.
+- Everything must be inside the `### ARTIFACT` (type DOC) block. Output with no
+  `### ARTIFACT` wrapper is rejected as malformed and applies nothing.
 - The orchestrator does NOT touch scope/ or test_models/ at DOC time. Your DOC is
-  validated by the Guardian (SG/TG); the files are written only when the Guardian
-  emits the PRO-SCOPE / PRO-TEST signal referencing your DOC.
-- `### APPLICATION_NOTES` is your report — never written as a file.
+  validated by the Guardian (SG/TG); files are written only when the Guardian emits
+  the PRO-SCOPE / PRO-TEST signal referencing your DOC.
 """
 
 

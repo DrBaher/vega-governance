@@ -18,7 +18,13 @@ from state_manager import LOCKS, atomic_write
 
 
 _FILE_MARKER_RE = re.compile(r"(?m)^###[ \t]+FILE:[ \t]*(.+?)[ \t]*$")
+_EDIT_MARKER_RE = re.compile(r"(?m)^###[ \t]+EDIT:[ \t]*(.+?)[ \t]*$")
 _APP_NOTES_RE = re.compile(r"(?m)^###[ \t]+APPLICATION_NOTES[ \t]*$")
+# Git-conflict-style find/replace inside an ### EDIT: block. These markers are
+# vanishingly unlikely to occur in markdown scope docs, so they're safe delimiters.
+_EDIT_OP_RE = re.compile(
+    r"<<<<<<<[ \t]*FIND[ \t]*\r?\n(.*?)\r?\n=======[ \t]*\r?\n(.*?)\r?\n>>>>>>>[ \t]*REPLACE",
+    re.S)
 
 
 def parse_file_sections(content: str) -> dict[str, str]:
@@ -39,6 +45,35 @@ def parse_file_sections(content: str) -> dict[str, str]:
         if name:
             out[name] = body
     return out
+
+
+def parse_edit_ops(content: str) -> list[tuple[str, str, str]]:
+    """Parse a DOC body's `### EDIT: <name>` blocks into surgical find/replace ops
+    [(filename, find_text, replace_text), ...] (sc4 §4.3, patch mode). Each block
+    carries one git-conflict-style op:
+
+        ### EDIT: doc.md
+        <<<<<<< FIND
+        <exact current text to locate>
+        =======
+        <replacement text>
+        >>>>>>> REPLACE
+
+    Lets SE/TE edit large files without re-emitting them. Content past
+    `### APPLICATION_NOTES` (the report) is ignored. Returns [] if no EDIT blocks."""
+    notes = _APP_NOTES_RE.search(content)
+    limit = notes.start() if notes else len(content)
+    matches = [m for m in _EDIT_MARKER_RE.finditer(content) if m.start() < limit]
+    ops: list[tuple[str, str, str]] = []
+    for i, m in enumerate(matches):
+        name = m.group(1).strip().strip("[]").strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else limit
+        block = content[start:end]
+        op = _EDIT_OP_RE.search(block)
+        if name and op and op.group(1):   # find text must be non-empty (an anchor)
+            ops.append((name, op.group(1), op.group(2)))
+    return ops
 
 
 def _read_text(path: str | Path) -> str:
