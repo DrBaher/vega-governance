@@ -194,6 +194,18 @@ async def test_commit_rejects_path_traversal(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_commit_finds_doc_not_at_references_0(tmp_path):
+    # PRO-SCOPE often lists VAL/SCN before the DOC (and agents may emit a
+    # placeholder like VAL-SG-NNN as references[0]). Commit must find the DOC.
+    doc = "### FILE: Scope_v7.2.md\nvalidated body\n\n### APPLICATION_NOTES\nok\n"
+    router, _ = _router_with_doc(tmp_path, "DOC-SE-002", doc)
+    pro = Artifact(type="PRO-SCOPE", sender="SG", id="PRO-SCOPE-002",
+                   references=["VAL-SG-NNN", "SCN-SG-005", "DOC-SE-002"])  # DOC is last
+    await router.commit_propagation_files(pro)
+    assert (tmp_path / "scope" / "Scope_v7.2.md").read_text().strip() == "validated body"
+
+
+@pytest.mark.asyncio
 async def test_commit_missing_doc_is_safe(tmp_path):
     router, _ = _router_with_doc(tmp_path)   # no DOC archived
     await router.commit_propagation_files(

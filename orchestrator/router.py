@@ -210,14 +210,29 @@ class Router:
                 print(f"[router] propagation_commit: {artifact.type} {artifact.id} "
                       f"has no referenced DOC — nothing committed", flush=True)
                 return
-            doc_id = artifact.references[0]
-            doc = self.store.load_from_archive(doc_id)
+            # Find the DOC among the references — don't assume references[0]. A
+            # PRO-* signal may list the VAL/SCN before the DOC (and an agent may
+            # even emit a placeholder like VAL-SG-NNN as the first ref). Pick the
+            # first reference that archives as a DOC carrying ### FILE:/### EDIT:
+            # markers.
+            doc = None
+            doc_id = None
+            files: dict[str, str] = {}
+            edit_ops: list[tuple[str, str, str]] = []
+            for ref_id in artifact.references:
+                cand = self.store.load_from_archive(ref_id)
+                if cand is None:
+                    continue
+                f = parse_file_sections(cand.content)
+                e = parse_edit_ops(cand.content)
+                if f or e or str(cand.type).upper().startswith("DOC"):
+                    doc, doc_id, files, edit_ops = cand, ref_id, f, e
+                    break
             if doc is None:
-                print(f"[router] propagation_commit: DOC {doc_id} not in archive "
-                      f"(for {artifact.id}) — nothing committed", flush=True)
+                print(f"[router] propagation_commit: no referenced DOC found in "
+                      f"{artifact.references} (for {artifact.id}) — nothing committed",
+                      flush=True)
                 return
-            files = parse_file_sections(doc.content)
-            edit_ops = parse_edit_ops(doc.content)
             if not files and not edit_ops:
                 print(f"[router] propagation_commit: no ### FILE: or ### EDIT: markers "
                       f"in {doc_id} (for {artifact.id}) — nothing committed", flush=True)
