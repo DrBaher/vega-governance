@@ -61,7 +61,7 @@ class Orchestrator:
     def __init__(self) -> None:
         self.cfg = config
         # Generous timeout: a validated-SCN application has SE ingest the targeted
-        # scope docs (can be ~80k tokens) + adaptive thinking, so a single streamed
+        # scope docs (can be ~80k tokens) + extended thinking, so a single streamed
         # call can legitimately run several minutes. The default (~10 min) can cut
         # that off; too-short would kill valid work. Bounded so a stalled stream
         # still eventually errors instead of blocking the tick loop forever.

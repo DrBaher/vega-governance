@@ -641,18 +641,19 @@ class AgentExecutor:
     async def _call_with_retry(self, model: str, system: str,
                                messages: list[dict[str, Any]],
                                max_retries: int = 3) -> tuple[Any, Optional[Exception]]:
-        # Try in order: adaptive (Claude 4.x), enabled+budget (legacy), no thinking
-        # The first call uses the configured mode; on a thinking-shape API error,
-        # subsequent retries try the alternatives. This makes the orchestrator
-        # robust to Anthropic API surface changes between SDK versions / model
-        # families (the spec was written against the older 'enabled' shape).
+        # Thinking must be BOUNDED. "adaptive" lets the model think up to max_tokens
+        # with no reserve for output — on a large-input SCN application it consumed
+        # the whole budget and emitted thinking-only / empty text → malformed, every
+        # time (and slowly). "enabled" with an explicit budget_tokens is the Claude-4
+        # extended-thinking format; with MAX_TOKENS comfortably above the budget,
+        # output always has room. None (no thinking) is the final fallback so a
+        # thinking-shape rejection still yields output. Adaptive is intentionally
+        # NOT used — it's the runaway-empty-output failure mode.
         thinking_modes: list[dict[str, Any] | None] = []
         if self.config.EXTENDED_THINKING_ENABLED:
-            thinking_modes.extend([
-                {"type": "adaptive"},                                    # current Claude 4.x
+            thinking_modes.append(
                 {"type": "enabled",
-                 "budget_tokens": self.config.THINKING_BUDGET_TOKENS},   # legacy Claude 3.x
-            ])
+                 "budget_tokens": self.config.THINKING_BUDGET_TOKENS})
         thinking_modes.append(None)                                       # always last fallback
 
         last_error: Optional[Exception] = None
