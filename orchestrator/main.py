@@ -60,7 +60,15 @@ class Orchestrator:
 
     def __init__(self) -> None:
         self.cfg = config
-        self.client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+        # Generous timeout: a validated-SCN application has SE ingest the targeted
+        # scope docs (can be ~80k tokens) + adaptive thinking, so a single streamed
+        # call can legitimately run several minutes. The default (~10 min) can cut
+        # that off; too-short would kill valid work. Bounded so a stalled stream
+        # still eventually errors instead of blocking the tick loop forever.
+        self.client = AsyncAnthropic(
+            api_key=config.ANTHROPIC_API_KEY,
+            timeout=getattr(config, "ANTHROPIC_TIMEOUT", 1800.0),
+        )
 
         self.sequences = SequenceManager(config.STATE_DIR)
         self.instances = InstanceManager(config.STATE_DIR)

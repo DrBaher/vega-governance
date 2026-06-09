@@ -66,6 +66,11 @@ MAX_TOKENS = 32000   # Per agent execution. Covers extended-thinking + output.
                      # non-streaming ~21k ceiling. 16000 was too small for Sonnet
                      # adaptive thinking on complex tasks (thinking ate the budget).
 
+# Anthropic client timeout (seconds). A validated-SCN application can have SE
+# ingest ~80k tokens of scope + think, so a single streamed call runs minutes;
+# the default would cut it off. Bounded so a stalled stream still errors out.
+ANTHROPIC_TIMEOUT = 1800.0
+
 # ─── Polling ─────────────────────────────────────────────────────────────────
 POLL_INTERVAL = 10   # Seconds between inbox checks
 
